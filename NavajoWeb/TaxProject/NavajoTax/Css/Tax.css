@@ -1,0 +1,90 @@
+﻿
+    body
+        {
+            font-family: Calibri,Arial,sans-serif;
+        }
+        .divPopup
+        {
+            display: none;
+        }
+        .header
+        {
+            width: 100%;
+            color: White;
+            background-color: #4682B4;
+        }
+        .header td
+        {
+            padding-right: 24px;
+        }
+        .header h1, .header h2, .header h3
+        {
+            margin-top: 0px;
+            margin-bottom: 0px;
+        }
+        
+        /* Override jQuery UI widget size. */
+        .ui-widget
+        {
+            font-size: 1em;
+        }
+        INPUT.ui-button
+        {
+            /*padding-top: 0px;
+            padding-bottom: 0px;*/
+        }
+        #btnLogin, #btnHeaderLogout, #btnLogout, #btnShowAccountRemarksPopup, #btnShowTaxRollRemarksPopup, #btnShowOtherYearRemarksPopup, #btnPosLoadPosting,#btnViewCP,#btnPrintDeed
+        {
+            padding-top: 0px;
+            padding-bottom: 0px;
+        }
+        .ReadOnly
+        {
+            color: DimGray;
+        }
+        .rightAlign 
+        { 
+            text-align:right; 
+        }
+         .trBorder 
+        { 
+            border: thin groove #C0C0C0;             
+        }
+        .style1
+        {
+            width: 128px;
+        }
+        
+        #divAccountAlert, #divAccountSuspend
+        {
+            border-color: Black;
+            border-style: solid;
+            background-color: Red;
+            color: White;
+            padding-left: 2px;
+            padding-right: 2px;
+        }
+        .Popup
+        {
+            position: fixed;
+            margin:0px 25%;
+            z-index: 99999;
+        }
+        .InnerPopup
+        {
+            margin: auto;
+            min-width: 380px;
+            min-height: 200px;
+            background-color: #4682B4;
+            padding: 30px;
+            -moz-border-radius-topright: 50px;          
+            -moz-border-radius-topleft: 50px;            
+            -moz-border-radius-bottomright: 50px;      
+            -moz-border-radius-bottomleft: 50px;           
+            border: 1px solid Black;
+        }
+        .yellowButton
+        {
+            background-color:Yellow
+        }
+

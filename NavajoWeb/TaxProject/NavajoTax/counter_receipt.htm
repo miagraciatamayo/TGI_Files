@@ -1,0 +1,138 @@
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head id="Head1" runat="server">
+    <title></title>
+
+    <link href="Css/redmond/jquery-ui-1.8.23.custom.css" rel="stylesheet" type="text/css" />
+    <link href="Css/Tax.css" rel="stylesheet" type="text/css" />
+    <script type="text/javascript" src="JavaScript/jquery-1.5.1.min.js"></script>
+    <script type="text/javascript" src="JavaScript/jquery-ui-1.8.23.custom.min.js"></script>
+    <script type="text/javascript" src="JavaScript/jquery.maskedinput-1.3.min.js"></script>
+    <script type="text/javascript" src="JavaScript/jquery.validate.js"></script>
+	<style type="text/css">
+	.style1 {
+		text-align: center;
+	}
+	</style>
+</head>
+<body>
+    <form id="form1" runat="server">
+    <div style="width: 800px">
+        <div class="header">
+        <table>
+            <tr>
+                <td rowspan="3">
+                    <img alt="Navajo County Logo" width="74" height="74" src="logo.png" />
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    <h1>
+                        Navajo County Treasurer</h1>
+                </td>
+
+            </tr>
+            <tr>
+
+            </tr>
+        </table>
+    </div>
+        <br />
+        <br />
+        <div id="divreportContent">
+            <div>
+                <br />
+                <br />
+                <p class="style1" style ="width: 800px"><b>Tax Payment Summary for</b> <br />
+
+                <asp:Label ID="TaxIDNumber" runat="server"></asp:Label>
+
+                <asp:Label ID="GETDATE" runat="server" ></asp:Label></p>
+                <br />
+				<asp:Label ID="OWNER_NAME_1" runat="server"></asp:Label>
+                <br />
+                <asp:Label ID="MAIL_ADDRESS_2" runat="server"></asp:Label>
+                <br />
+                <asp:Label ID="MAIL_CITY" runat="server"></asp:Label> <asp:Label ID="MAIL_STATE" runat="server"></asp:Label> <asp:Label ID="MAIL_CODE" runat="server"></asp:Label>
+                <br />
+                <br />
+                Payment summary for tax year <asp:Label ID="TaxYear" runat="server"></asp:Label> and Tax Roll Number <asp:Label ID="TaxRollNumber" runat="server"></asp:Label>:
+                <br />
+                <br />
+                <table style="width: 100%;">
+                    <tr>
+                        <td style="width: 200px; padding-left: 20px;">
+                            Total Tax:
+                        </td>
+                        <td>
+                          <asp:Label ID="lblActive" runat="server" ></asp:Label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="width: 200px; padding-left: 20px;">
+                            Total Interest:
+                        </td>
+                        <td>
+                           <asp:Label ID="lblSSN" runat="server" ></asp:Label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="width: 200px; padding-left: 20px;">
+                            Total Fees:</td>
+                        <td>
+                            <asp:Label ID="lblVendorNum" runat="server" ></asp:Label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="width: 200px; padding-left: 20px;">
+                            Total Payments:
+                        </td>
+                        <td>
+                            <asp:Label ID="lblPhone" runat="server" ></asp:Label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="width: 200px; padding-left: 20px; height: 23px;">
+                            Balance:
+                        </td>
+                        <td style="height: 23px">
+                            <asp:Label ID="lblEMail" runat="server" ></asp:Label>
+                        </td>
+                    </tr>
+                    </table>
+                <p>Payment History:</p>
+                <table align="center" style="width: 70%">
+					<tr>
+						<td style="width: 200px;">Remitted By</td>
+						<td style="width: 200px;">Payment Date</td>
+						<td style="width: 200px;">Payment Amount</td>
+					</tr>
+					<tr>
+						<td>
+                            <asp:Label ID="Pertinent1" runat="server" ></asp:Label>
+                        </td>
+						<td>
+                            <asp:Label ID="PaymentEffectiveDate" runat="server" ></asp:Label>
+                        </td>
+						<td>
+                            <asp:Label ID="PaymentAmount" runat="server" ></asp:Label>
+                        </td>
+					</tr>
+				</table>
+                <br />
+                Very truly yours,
+                <br />
+                <br />
+                <asp:Label ID="lblSignature" runat="server" ></asp:Label>
+                <br />
+
+            </div>
+            <br />
+            <br />
+        </div>
+    </div>
+    </form>
+</body>
+</html>
+

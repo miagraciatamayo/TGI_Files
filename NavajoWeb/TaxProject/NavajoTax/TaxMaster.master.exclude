@@ -1,0 +1,190 @@
+﻿<%@ Master Language="VB" CodeFile="TaxMaster.master.vb" Inherits="TaxMaster" %>
+
+<%@ Register TagPrefix="ajaxToolkit" Namespace="AjaxControlToolkit" Assembly="AjaxControlToolkit" %>
+<%@ Register Src="UserControls/Header.ascx" TagName="Header" TagPrefix="uc1" %>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head runat="server">
+    <title></title>
+    <link href="Css/redmond/jquery-ui-1.8.23.custom.css" rel="stylesheet" type="text/css" />
+    <link href="Css/Tax.css" rel="stylesheet" type="text/css" />
+    <%--<style type="text/css">
+        body
+        {
+            font-family: Calibri,Arial,sans-serif;
+        }
+        .divPopup
+        {
+            display: none;
+        }
+        .header
+        {
+            width: 100%;
+            color: White;
+            background-color: #4682B4;
+        }
+        .header td
+        {
+            padding-right: 24px;
+        }
+        .header h1, .header h2, .header h3
+        {
+            margin-top: 0px;
+            margin-bottom: 0px;
+        }
+        
+        /* Override jQuery UI widget size. */
+        .ui-widget
+        {
+            font-size: 1em;
+        }
+        INPUT.ui-button
+        {
+            /*padding-top: 0px;
+            padding-bottom: 0px;*/
+        }
+        #btnLogin, #btnHeaderLogout, #btnLogout, #btnShowAccountRemarksPopup, #btnShowTaxRollRemarksPopup, #btnShowOtherYearRemarksPopup
+        {
+            padding-top: 0px;
+            padding-bottom: 0px;
+        }
+        .ReadOnly
+        {
+            color: DimGray;
+        }
+        .style1
+        {
+            width: 128px;
+        }
+        
+        #divAccountAlert, #divAccountSuspend
+        {
+            border-color: Black;
+            border-style: solid;
+            background-color: Red;
+            color: White;
+            padding-left: 2px;
+            padding-right: 2px;
+        }
+    </style>--%>
+    <script type="text/javascript" src="JavaScript/jquery-1.5.1.min.js"></script>
+    <script type="text/javascript" src="JavaScript/jquery-ui-1.8.23.custom.min.js"></script>
+    <script type="text/javascript" src="JavaScript/jquery.maskedinput-1.3.min.js"></script>
+    <script type="text/javascript" src="JavaScript/jquery.validate.js"></script>
+    <script type="text/javascript" language="javascript">
+        $(document).ready(function () {
+            // set jQueryUI style on buttons
+            $("#btnHeaderLogout").button();
+            $("#btnLogin").button();
+            $("#btnLogout").button();
+
+
+            $("#btnLogin").click(function (e) {
+                if (!$("form").valid()) {
+                    e.preventDefault();
+                }
+            });
+
+            $("#btnLogout").click(function (e) {
+                if (!$("form").valid()) {
+                    e.preventDefault();
+                }
+            });
+
+
+            $("#btnHeaderLogout").click(function (e) {
+                showLogoutDialog()
+            });
+
+
+            $("form").submit(function () {
+                // Form submit
+                var action = document.getElementById("form1").action;
+
+                if (action.lastIndexOf("#") >= 0) {
+                    action = action.substr(0, action.lastIndexOf("#"));
+                }
+
+                document.getElementById("form1").action = action + window.location.hash;
+            });
+        });
+
+
+        function showLoginDialog() {
+            $("#divLogin").dialog({
+                modal: true
+            }).parent().appendTo("form");
+        }
+
+        function showLogoutDialog() {
+            $("#divLogout").dialog({
+                modal: true
+            }).parent().appendTo("form");
+        }
+
+        // Validation.
+        $("form").validate({
+            ignoreTitle: true,
+            ignore: ":hidden",
+            errorClass: "ui-state-error",
+            errorPlacement: function (error, element) {
+                element.after(error).after(" ");
+            }
+        });
+    </script>
+</head>
+<body>
+    <form id="form1" runat="server">
+     <asp:ScriptManager ID="ScriptManager1" runat="server">
+    </asp:ScriptManager>
+    <div>
+        <asp:ContentPlaceHolder ID="head" runat="server">
+            <div class="header">
+                <table>
+                    <tr>
+                        <td style="width: 95%;">
+                            <uc1:Header ID="Header1" runat="server" />
+                        </td>
+                        <td>
+                            <asp:Button ID="btnHeaderLogout" runat="server" Text="Logout" ClientIDMode="Static"
+                                OnClientClick="return false;" />
+                            <%--<input id="btnHeaderLogout" type="button" value="Logout" />--%>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </asp:ContentPlaceHolder>
+        <asp:ContentPlaceHolder ID="body" runat="server">
+            <!-- Modal popup divs -->
+            <div id="divLoading" title="Loading, please wait..." class="divPopup">
+                <img src="ajax-loader_redmond.gif" alt="Loading..." width="220" height="19" />
+            </div>
+            <div id="divMessage" class="divPopup">
+                <p id="pMessage">
+                </p>
+            </div>
+            <div id="divLogin" title="Login" class="divPopup">
+                <fieldset>
+                    <b>Cashier:</b>
+                    <asp:Label ID="lblLoginUsername" runat="server"></asp:Label>
+                    <br /><b>Cash at Login:</b>
+                    <asp:TextBox ID="txtLoginStartCash" runat="server" Width="100px" CssClass="required number"></asp:TextBox>
+                </fieldset>
+                <asp:Button ID="btnLogin" runat="server" Text="Login" ClientIDMode="Static" />
+            </div>
+            <div id="divLogout" title="Logout" class="divPopup">
+                <fieldset>
+                    <b>Cashier:</b>
+                    <asp:Label ID="lblLogoutUsername" runat="server"></asp:Label>
+                    <br /><b>Cash at Logout:</b>
+                    <asp:TextBox ID="txtLogoutEndCash" runat="server" Width="100px" CssClass="required number"></asp:TextBox>
+                </fieldset>
+                <asp:Button ID="btnLogout" runat="server" Text="Logout" ClientIDMode="Static" />
+            </div>
+            <asp:ContentPlaceHolder ID="ContentPlaceHolder1" runat="server">
+            </asp:ContentPlaceHolder>
+        </asp:ContentPlaceHolder>
+    </div>
+    </form>
+</body>
+</html>

@@ -1,0 +1,763 @@
+﻿Imports System.IO
+Imports Microsoft.PointOfService
+
+
+
+Namespace Printing
+    Public MustInherit Class Printer
+
+        Protected Shared WithEvents _printer As PosPrinter
+
+        Protected Const ESC_ALIGN_LEFT As String = Chr(27) & Chr(97) & Chr(48)
+        Protected Const ESC_ALIGN_CENTER As String = Chr(27) & Chr(97) & Chr(49)
+        Protected Const ESC_ALIGN_RIGHT As String = Chr(27) & Chr(97) & Chr(50)
+        Protected Const ESC_FONT_REGULAR As String = Chr(27) & Chr(69) & Chr(0)
+        Protected Const ESC_FONT_BOLD As String = Chr(27) & Chr(69) & Chr(1)
+        Protected Const ESC_CHAR_WIDE As String = Chr(29) & Chr(33) & Chr(16)
+
+#Region "Device Functions"
+        Public Shared Function GetDevices() As Generic.List(Of DeviceInfo)
+            Dim explorer As New PosExplorer()
+            Dim devices As DeviceCollection
+
+            If Utilities.IsDebug() Then
+                devices = explorer.GetDevices(DeviceType.PosPrinter, _
+                                              DeviceCompatibilities.OposAndCompatibilityLevel1)
+            Else
+                devices = explorer.GetDevices(DeviceType.PosPrinter, _
+                                              DeviceCompatibilities.Opos)
+            End If
+
+            Dim result As New Generic.List(Of DeviceInfo)(devices.Count)
+            For Each dev As DeviceInfo In devices
+                result.Add(dev)
+            Next
+
+            Return result
+        End Function
+
+        Public Shared Function GetDeviceDisplayName(ByVal dev As DeviceInfo)
+            Dim name As String = String.Join(";", dev.LogicalNames)
+            If String.IsNullOrEmpty(name) Then
+                name = dev.ServiceObjectName
+                If String.IsNullOrEmpty(name) Then
+                    name = dev.Description
+                End If
+            End If
+            Return name
+        End Function
+
+        Protected Shared Function GetDevice() As PosPrinter
+            Dim dfltPrinter As String = Utilities.POSPrinterName
+
+            If String.IsNullOrEmpty(dfltPrinter) Then
+                Return Nothing
+            End If
+
+            For Each dev As DeviceInfo In Printer.GetDevices()
+                If dfltPrinter = Printer.GetDeviceDisplayName(dev) Then
+                    Return New PosExplorer().CreateInstance(dev)
+                End If
+            Next
+            Throw New ObjectNotFoundException("Receipt printer not found.")
+        End Function
+
+        Public Shared Sub OpenDevice()
+            If _printer Is Nothing Then
+                _printer = GetDevice()
+            End If
+            If _printer Is Nothing Then
+                Throw New ObjectNotFoundException("Receipt printer not found.")
+            End If
+
+
+            If _printer.State = ControlState.Closed Then _printer.Open()
+            If Not _printer.Claimed Then _printer.Claim(1000)
+            If _printer.PowerNotify = PowerNotification.Disabled _
+                    AndAlso _printer.DeviceEnabled = False Then
+                _printer.PowerNotify = PowerNotification.Enabled
+            End If
+            If Not _printer.DeviceEnabled Then _printer.DeviceEnabled = True
+        End Sub
+
+        Public Shared Sub CloseDevice()
+            If _printer IsNot Nothing Then
+                If _printer.DeviceEnabled Then _printer.DeviceEnabled = False
+                If _printer.Claimed Then _printer.Release()
+                If _printer.State <> ControlState.Closed Then _printer.Close()
+                _printer = Nothing
+            End If
+        End Sub
+
+        Protected ReadOnly Property RecLineWidth
+            Get
+                If _printer IsNot Nothing AndAlso _printer.RecLineWidth > 0 Then
+                    Return _printer.RecLineWidth
+                Else
+                    ' Default.
+                    Return 512
+                End If
+            End Get
+        End Property
+
+        Protected ReadOnly Property RecLineChars
+            Get
+                If _printer IsNot Nothing AndAlso _printer.RecLineChars > 0 Then
+                    Return _printer.RecLineChars
+                Else
+                    ' Default.
+                    Return 42
+                End If
+            End Get
+        End Property
+#End Region
+
+#Region "Helper Functions"
+        Protected Function ExtractPrintableCharacters(ByVal input As String) As String
+            ' Remove OPOS escape codes.
+            input = input.Replace(ESC_ALIGN_CENTER, String.Empty)
+            input = input.Replace(ESC_ALIGN_LEFT, String.Empty)
+            input = input.Replace(ESC_ALIGN_RIGHT, String.Empty)
+            input = input.Replace(ESC_CHAR_WIDE, String.Empty)
+            input = input.Replace(ESC_FONT_BOLD, String.Empty)
+            input = input.Replace(ESC_FONT_REGULAR, String.Empty)
+
+            ' Extract other control characters.
+            Dim result As New System.Text.StringBuilder()
+            For Each c As Char In input.ToCharArray()
+                If Not Char.IsControl(c) Then
+                    result.Append(c)
+                End If
+            Next
+            Return result.ToString()
+        End Function
+#End Region
+
+#Region "Common Printing Methods"
+        Protected Sub CutPaper()
+            For i As Integer = 1 To _printer.RecLinesToPaperCut
+                PrintLine()
+            Next
+            _printer.CutPaper(98)
+        End Sub
+
+        Protected Sub PrintLine()
+            PrintLine(String.Empty)
+        End Sub
+
+        Protected Sub PrintLine(ByVal text As String)
+            _printer.PrintNormal(PrinterStation.Receipt, text & vbCrLf)
+        End Sub
+
+        Protected Sub PrintLine(ByVal leftText As String, ByVal middleText As String, _
+                                     ByVal rightText As String, _
+                                     Optional ByVal trim As Boolean = True)
+            Dim lineWidth As Integer = Me.RecLineChars
+
+            If trim Then
+                Dim leftLength As Integer = ExtractPrintableCharacters(leftText).Length
+                Dim middleLength As Integer = ExtractPrintableCharacters(middleText).Length
+                Dim rightLength As Integer = ExtractPrintableCharacters(rightText).Length
+
+                Dim totalChars As Integer = leftLength + middleLength + rightLength
+                If (totalChars + 2) > lineWidth Then
+                    Dim trimPct As Decimal = (totalChars - lineWidth) / totalChars
+                    leftText = leftText.Substring(0, Math.Floor(trimPct * leftLength))
+                    middleText = middleText.Substring(0, Math.Floor(trimPct * middleLength))
+                    rightText = rightText.Substring(0, Math.Floor(trimPct * rightLength))
+                End If
+
+                Dim startMiddle As Integer = (lineWidth / 2) - (middleLength / 2)
+                Dim startRight As Integer = lineWidth - rightLength
+
+                Dim finalText As String = leftText
+                finalText &= New String(" ", Math.Max(startMiddle - ExtractPrintableCharacters(finalText).Length, 1))
+                finalText &= middleText
+                finalText &= New String(" ", Math.Max(startRight - ExtractPrintableCharacters(finalText).Length, 1))
+                finalText &= rightText
+
+                PrintLine(finalText)
+            Else
+                Throw New NotImplementedException()
+            End If
+        End Sub
+
+        Protected Sub PrintLogo()
+            If Not _printer.CapRecBitmap Then
+                Exit Sub
+            End If
+
+            Dim logoFileName As String = Utilities.CleanerLogo
+
+            ' Prepare default logo from resources.
+            If String.IsNullOrEmpty(logoFileName) Then
+                ' Create file from resources.
+                logoFileName = Path.Combine(Path.GetTempPath(), GetType(Main).GUID.ToString() & ".bmp")
+                If Not File.Exists(logoFileName) Then
+                    My.Resources.logo.Save(logoFileName)
+                End If
+            End If
+
+            If File.Exists(logoFileName) Then
+                Dim bmp As New Bitmap(logoFileName)
+                _printer.MapMode = MapMode.Dots
+                Dim width As Integer = Math.Min(bmp.Width, RecLineWidth)
+
+                _printer.PrintBitmap(PrinterStation.Receipt, logoFileName, width, PosPrinter.PrinterBitmapCenter)
+            End If
+        End Sub
+
+        Protected Sub PrintSeparator(Optional ByVal character As Char = "-"c)
+            PrintLine(New String(character, Me.RecLineChars))
+        End Sub
+
+        Protected Sub PrintHeader(ByVal printCurrentDate As Boolean)
+            PrintLogo()
+
+            ' Center align and print address
+            PrintLine(ESC_ALIGN_CENTER & Utilities.CurrentCleaner.CLEANER_ADDRESS)
+
+            ' Print current date
+            If printCurrentDate Then
+                PrintLine(ESC_ALIGN_CENTER & Date.Now.ToString())
+            End If
+        End Sub
+#End Region
+
+#Region "Common Order Printing Methods"
+        Protected Sub PrintOrderNotes(ByVal order As DB.CUSTOMER_ORDER)
+            If Not String.IsNullOrEmpty(order.NOTES) Then
+                PrintLine("Special Instructions: " & order.NOTES)
+            End If
+        End Sub
+
+        Protected Sub PrintBarcode(ByVal order As DB.CUSTOMER_ORDER)
+            If Not _printer.CapRecBarCode Then
+                Exit Sub
+            End If
+
+            Dim text As String = String.Format("{0:000000000000}", order.ORDER_ID)
+            Try
+                _printer.PrintBarCode(PrinterStation.Receipt, text, _
+                                      BarCodeSymbology.Upca, _
+                                      100, 450, _
+                                      PosPrinter.PrinterBarCodeCenter, _
+                                      BarCodeTextPosition.Below)
+            Catch ex As NotImplementedException
+                ' Bar code printing not implemented.
+            End Try
+        End Sub
+
+#End Region
+
+        Private Shared Sub _printer_StatusUpdateEvent(ByVal sender As Object, ByVal e As Microsoft.PointOfService.StatusUpdateEventArgs) Handles _printer.StatusUpdateEvent
+            If e.Status = 2003 Or e.Status = 2004 Then
+                ' Powered off.
+                CloseDevice()
+            End If
+        End Sub
+    End Class
+
+    Public Class TicketPrinter
+        Inherits Printer
+
+        Public Sub New()
+            ' Default constructor.
+        End Sub
+
+        'Public Sub New(ByVal order As DB.CUSTOMER_ORDER)
+        '    Me.Order = order
+        'End Sub
+
+        'Private _order As DB.CUSTOMER_ORDER
+        'Public Property Order() As DB.CUSTOMER_ORDER
+        '    Get
+        '        Return _order
+        '    End Get
+        '    Set(ByVal value As DB.CUSTOMER_ORDER)
+        '        _order = value
+        '    End Set
+        'End Property
+
+        Public Sub Print()
+            'If Me.Order Is Nothing Then
+            '    Throw New InvalidOperationException("TicketPrinter.Order should be assigned before printing.")
+            'End If
+
+            OpenDevice()
+
+            'Dim cleanerTypeGroups = From item In Order.CUST_ORDER_ITEM
+            '                     Group item By Key = item.CLEANER_TYPE Into Group
+            '                     Select CleanerType = Key, ItemGroup = Group
+
+            'For Each cleanerTypeGroup In cleanerTypeGroups
+            '    PrintCleanerTypeTicket(cleanerTypeGroup.CleanerType, _
+            '                           cleanerTypeGroup.ItemGroup)
+            'Next
+        End Sub
+
+        Private Sub PrintCleanerTypeTicket(ByVal cleanerType As Integer?, _
+                                                 ByVal itemGroup As IEnumerable(Of DB.CUST_ORDER_ITEM))
+            ' Exit if no items in group.
+            If itemGroup.Count = 0 Then
+                Exit Sub
+            End If
+
+            ' Header.
+            PrintLogo()
+            Dim order As DB.CUSTOMER_ORDER = itemGroup.First().CUSTOMER_ORDER
+            ' Order ID
+            PrintLine(ESC_CHAR_WIDE & CStr(order.ORDER_ID))
+            ' Cleaner Type
+            Dim coll = From io In Utilities.CachedEntity.ITEM_OPTION
+                        Where io.OPTION_ID = cleanerType
+            Dim cleanerTypeName As String = String.Empty
+            If coll.Count > 0 Then
+                cleanerTypeName = coll.First().OPTION_NAME
+            End If
+            PrintLine(String.Format("{0}{1} items", ESC_FONT_BOLD, cleanerTypeName))
+            ' Order date and customer name.
+            PrintLine(String.Format("Drop-off Date: {0}{1:g}", Printer.ESC_FONT_BOLD, order.ORDER_DATE))
+            ' Order available date.
+            If order.ORDER_AVAIL_DATE.HasValue Then
+                PrintLine(String.Format("Pick up: {0}", _
+                                        order.ORDER_AVAIL_DATE.Value.ToString()))
+            End If
+            ' Customer name.
+            PrintLine(ESC_CHAR_WIDE & DB.Helper.FormatCustomerName(order.CUSTOMER))
+            ' Customer phone.
+            PrintLine(String.Format("Phone: {0}{1}", ESC_FONT_BOLD, order.CUSTOMER.PHONE_1))
+            PrintLine()
+
+            ' Print items.
+            PrintLine("Item", String.Empty, "Count")
+            PrintSeparator()
+            Dim itemCount As Integer = 0
+            For Each item In itemGroup
+                PrintTicketItemLine(item)
+                itemCount += item.ITEM_COUNT.GetValueOrDefault(0)
+            Next
+            ' Total count.
+            PrintLine(ESC_ALIGN_RIGHT & ESC_CHAR_WIDE & "Total Items: " & CStr(itemCount))
+            PrintSeparator()
+
+            ' Print order notes.
+            PrintOrderNotes(order)
+
+            ' Print order balance and bar code.
+            PrintTicketBalance()
+            PrintBarcode(order)
+
+            ' Space for tag staple.
+            For i As Integer = 1 To 6
+                PrintLine()
+            Next
+
+            ' Cut paper.
+            CutPaper()
+        End Sub
+
+        Private Sub PrintTicketItemLine(ByVal item As DB.CUST_ORDER_ITEM)
+            Dim lineWidth As Integer = Me.RecLineChars
+            Dim itemCount As String = CStr(item.ITEM_COUNT)
+            Dim itemName As String = DB.Helper.GetItemName(Utilities.CachedEntity, item.ITEM_TYPE_ID)
+            If itemName.Length + itemCount.Length + 2 >= lineWidth Then
+                itemName = itemName.Substring(0, lineWidth - itemCount.Length - 3)
+            End If
+            PrintLine(itemName, String.Empty, itemCount)
+
+            ' Tag number & starch option
+            Dim starchOption As String = String.Empty
+            If Not String.IsNullOrEmpty(item.ITEM_OPTIONS) Then
+                Select Case item.ITEM_OPTIONS
+                    Case DB.Enumerations.StarchPreferenceEnum.NoStarch
+                        starchOption = "No Starch"
+                    Case DB.Enumerations.StarchPreferenceEnum.LightStarch
+                        starchOption = "Light Starch"
+                    Case DB.Enumerations.StarchPreferenceEnum.MediumStarch
+                        starchOption = "Medium Starch"
+                    Case DB.Enumerations.StarchPreferenceEnum.HeavyStarch
+                        starchOption = "Heavy Starch"
+                    Case Else
+                        starchOption = item.ITEM_OPTIONS
+                End Select
+            End If
+            If Not (String.IsNullOrEmpty(item.TICKET_NUM) AndAlso String.IsNullOrEmpty(starchOption)) Then
+                PrintLine("   " & item.TICKET_NUM, starchOption, String.Empty)
+            End If
+        End Sub
+
+        Private Sub PrintTicketBalance()
+            Dim orderTotal As Decimal? = DB.Helper.GetOrderTotal(Order)
+            Dim paymentTotal As Decimal? = DB.Helper.GetPaymentTotal(Order)
+
+            If orderTotal.HasValue AndAlso orderTotal > 0 AndAlso paymentTotal.HasValue Then
+                PrintLine()
+                PrintLine(ESC_ALIGN_CENTER & ESC_CHAR_WIDE & String.Format("BALANCE DUE {0:c}", orderTotal - paymentTotal))
+            End If
+        End Sub
+    End Class
+
+    Public Class ReceiptPrinter
+        Inherits Printer
+
+        Public Sub New()
+            ' Default constructor
+        End Sub
+
+        Public Sub New(ByVal order As DB.CUSTOMER_ORDER)
+            Me.Order = order
+        End Sub
+
+        Private _order As DB.CUSTOMER_ORDER
+        Public Property Order() As DB.CUSTOMER_ORDER
+            Get
+                Return _order
+            End Get
+            Set(ByVal value As DB.CUSTOMER_ORDER)
+                _order = value
+            End Set
+        End Property
+
+        Public Sub Print()
+            If Me.Order Is Nothing Then
+                Throw New InvalidOperationException("ReceiptPrinter.Order should be assigned before printing.")
+            End If
+
+
+            OpenDevice()
+
+            ' Header
+            PrintHeader(True)
+            PrintLine()
+
+            ' Order
+            PrintReceiptOrderHeader()
+            PrintSeparator()
+            PrintReceiptOrderItems()
+            PrintLine()
+
+            ' Payments
+            PrintReceiptPayments()
+            PrintOrderNotes(Order)
+            PrintReceiptBalance()
+            PrintLine()
+
+            ' Barcode
+            PrintBarcode(Order)
+
+            ' Tear
+            CutPaper()
+        End Sub
+
+        Private Sub PrintReceiptOrderItems()
+            Dim currCleanerType As Integer? = Nothing
+            For Each item As DB.CUST_ORDER_ITEM In (From it In Order.CUST_ORDER_ITEM
+                                                    Order By it.CLEANER_TYPE)
+
+                If Not item.CLEANER_TYPE.Equals(currCleanerType) Then
+                    ' Print cleaner type.
+                    currCleanerType = item.CLEANER_TYPE
+                    Dim coll = From io In Utilities.CachedEntity.ITEM_OPTION
+                                Where io.OPTION_ID = currCleanerType
+
+                    If coll.Count >= 1 Then
+                        PrintLine(ESC_FONT_BOLD & coll.First().OPTION_NAME)
+                    End If
+                End If
+
+                Dim itemType As String
+                If item.LAUNDRY_ITEM_TYPE Is Nothing Then
+                    itemType = DB.Enumerations.GENERIC_ITEM_NAME
+                Else
+                    itemType = item.LAUNDRY_ITEM_TYPE.ITEM_NAME
+                End If
+
+                Dim count As String = String.Format("{0}x{1:c}", item.ITEM_COUNT, item.ITEM_PRICE)
+                Dim total As String = String.Format("{0:c}", item.ITEM_COUNT * item.ITEM_PRICE)
+
+                PrintReceiptItemLine(itemType, count, total)
+
+                ' Starch option
+                If Not String.IsNullOrEmpty(item.ITEM_OPTIONS) Then
+                    Dim starchOption As String
+                    Select Case item.ITEM_OPTIONS
+                        Case DB.Enumerations.StarchPreferenceEnum.NoStarch
+                            starchOption = "No Starch"
+                        Case DB.Enumerations.StarchPreferenceEnum.LightStarch
+                            starchOption = "Light Starch"
+                        Case DB.Enumerations.StarchPreferenceEnum.MediumStarch
+                            starchOption = "Medium Starch"
+                        Case DB.Enumerations.StarchPreferenceEnum.HeavyStarch
+                            starchOption = "Heavy Starch"
+                        Case Else
+                            starchOption = item.ITEM_OPTIONS
+                    End Select
+                    PrintLine("   -" & starchOption)
+                End If
+            Next
+
+            ' Print sub-total.
+            PrintSeparator()
+            Dim orderTotal As Decimal? = DB.Helper.GetOrderTotal(Order)
+            PrintLine(ESC_ALIGN_RIGHT & _
+                      String.Format("TOTAL: {0:c}", If(orderTotal.HasValue, orderTotal.Value, String.Empty)))
+        End Sub
+
+        Private Sub PrintReceiptPayments()
+            If Order.ORDER_PAYMENT.Count = 0 Then
+                Exit Sub
+            End If
+
+            For Each payment As DB.ORDER_PAYMENT In Order.ORDER_PAYMENT
+                Select Case payment.PAYMENT_TYPE
+                    Case DB.Enumerations.PaymentTypeEnum.Cash
+                        PrintLine("Cash", _
+                                  String.Format("{0:M/d/yy HH:mm}", payment.PAYMENT_DATE), _
+                                  String.Format("{0:c}", payment.PAYMENT_AMOUNT))
+
+                    Case DB.Enumerations.PaymentTypeEnum.CreditCard
+                        PrintLine("Credit/Debit", _
+                                  String.Format("{0:M/d/yy HH:mm}", payment.PAYMENT_DATE), _
+                                  String.Format("{0:c}", payment.PAYMENT_AMOUNT))
+                        If payment.PAYMENT_CREDIT IsNot Nothing AndAlso Not String.IsNullOrEmpty(payment.PAYMENT_CREDIT.CARD_NUMBER) Then
+                            PrintLine(String.Format("Card Number:   {0}", _
+                                                              FormatCardNumber(payment.PAYMENT_CREDIT.CARD_NUMBER)))
+                        End If
+
+                    Case Else
+                        PrintLine("Other", _
+                                  String.Format("{0:M/d/yy HH:mm}", payment.PAYMENT_DATE), _
+                                  String.Format("{0:c}", payment.PAYMENT_AMOUNT))
+                End Select
+            Next
+
+            ' Print payment total if more than one payment.
+            If Order.ORDER_PAYMENT.Count > 1 Then
+                PrintSeparator()
+                Dim paymentTotal As Decimal? = DB.Helper.GetPaymentTotal(Order)
+                PrintLine(ESC_ALIGN_RIGHT & _
+                          String.Format("Payments: {0:c}", If(paymentTotal.HasValue, paymentTotal.Value, String.Empty)))
+            End If
+        End Sub
+
+        Private Sub PrintReceiptOrderHeader()
+            ' Order ID and client name.
+            PrintLine("Order #" & ESC_FONT_BOLD & Order.ORDER_ID)
+
+            ' Client name.
+            PrintLine(ESC_CHAR_WIDE & DB.Helper.FormatCustomerName(Order.CUSTOMER))
+
+            ' Order drop-off date.
+            PrintLine("Dropped off: " & If(Order.ORDER_DATE.HasValue, Order.ORDER_DATE.ToString(), String.Empty))
+
+            ' Order available date.
+            If Order.ORDER_AVAIL_DATE.HasValue Then
+                PrintLine(String.Format("Available for pick up: {0}{1} {2}", _
+                                        ESC_FONT_BOLD, _
+                                        Order.ORDER_AVAIL_DATE.Value.ToLongDateString(), _
+                                        Order.ORDER_AVAIL_DATE.Value.ToShortTimeString()))
+            End If
+        End Sub
+
+        Private Sub PrintReceiptBalance()
+            Dim orderTotal As Decimal? = DB.Helper.GetOrderTotal(Order)
+            Dim paymentTotal As Decimal? = DB.Helper.GetPaymentTotal(Order)
+
+            If orderTotal.HasValue AndAlso orderTotal > 0 AndAlso paymentTotal.HasValue Then
+                PrintLine()
+                PrintLine(ESC_ALIGN_CENTER & ESC_CHAR_WIDE & String.Format("BALANCE DUE {0:c}", orderTotal - paymentTotal))
+            End If
+        End Sub
+
+        Private Sub PrintReceiptItemLine(ByVal itemName As String, ByVal itemCount As String, _
+                                     ByVal itemPrice As String)
+            Dim lineWidth As Integer = Me.RecLineChars
+
+            Dim startMiddle As Integer = (lineWidth / 2) - (itemCount.Length / 2)
+            Dim startRight As Integer = lineWidth - itemPrice.Length
+            Dim totalChars As Integer = itemName.Length + itemCount.Length + itemPrice.Length
+            If (totalChars + 2) > lineWidth Then    ' Include 2 spaces.
+                Dim trimName As Integer = lineWidth - itemCount.Length - itemPrice.Length - 3
+                itemName = itemName.Substring(0, trimName)
+                startMiddle = itemName.Length + 1
+                startRight = itemName.Length + itemCount.Length + 3
+            End If
+
+            Dim finalText As String = itemName
+            finalText &= New String(" ", Math.Max(startMiddle - finalText.Length, 1))
+            finalText &= itemCount
+            finalText &= New String(" ", Math.Max(startRight - finalText.Length, 1))
+            finalText &= itemPrice
+
+            PrintLine(finalText)
+        End Sub
+
+        Private Function FormatCardNumber(ByVal cardNumber As String, Optional ByVal digits As Integer = 4) As String
+            If cardNumber.Length <= digits Then
+                Return cardNumber
+            Else
+                Return New String("*", cardNumber.Length - digits) & Right(cardNumber, digits)
+            End If
+        End Function
+    End Class
+
+    Public Class EmployeeSessionPrinter
+        Inherits Printer
+
+        Public Const ACTION_TYPE_PICKUP As String = "PICKUP"
+        Public Const ACTION_TYPE_CASH As String = "CASH PMT"
+        Public Const ACTION_TYPE_CARD As String = "CARD PMT"
+        Public Const ACTION_TYPE_COUPON As String = "COUPON PMT"
+        Public Const ACTION_TYPE_DISCOUNT As String = "DISCOUNT"
+        Public Const ACTION_TYPE_CHECK As String = "CHECK PMT"
+        Public Const ACTION_TYPE_LOGIN As String = "LOGIN"
+        Public Const ACTION_TYPE_LOGOUT As String = "LOGOUT"
+        Public Const ACTION_TYPE_DROPOFF As String = "DROP-OFF"
+
+        Public Sub New()
+            ' Default constructor.
+        End Sub
+
+        Public Sub New(ByVal employeeLogin As DB.EMPLOYEE_LOGIN, _
+                       ByVal transactions As Generic.List(Of DB.SESSION_SUMMARY))
+            Me.EmployeeLogin = employeeLogin
+            Me.Transactions = transactions
+        End Sub
+
+        Private _employeeLogin As DB.EMPLOYEE_LOGIN
+        Public Property EmployeeLogin() As DB.EMPLOYEE_LOGIN
+            Get
+                Return _employeeLogin
+            End Get
+            Set(ByVal value As DB.EMPLOYEE_LOGIN)
+                _employeeLogin = value
+            End Set
+        End Property
+
+        Private _transactions As Generic.List(Of DB.SESSION_SUMMARY)
+        Public Property Transactions() As Generic.List(Of DB.SESSION_SUMMARY)
+            Get
+                Return _transactions
+            End Get
+            Set(ByVal value As Generic.List(Of DB.SESSION_SUMMARY))
+                _transactions = value
+            End Set
+        End Property
+
+        Public Sub Print()
+            If Me.EmployeeLogin Is Nothing Then
+                Throw New InvalidOperationException("EmployeeSession.EmployeeLogin should be assigned before printing.")
+            End If
+            If Me.Transactions Is Nothing Then
+                Throw New InvalidOperationException("EmployeeSession.Transactions should be assigned before printing.")
+            End If
+
+            OpenDevice()
+
+            ' Print session information.
+            PrintSessionInfo()
+
+            ' Print transactions.
+            If Me.Transactions.Count > 0 Then
+                PrintLine()
+                PrintLine(ESC_FONT_BOLD & "Session Summary")
+                PrintSeparator()
+
+                PrintTransactions()
+                PrintSeparator()
+            End If
+
+            CutPaper()
+        End Sub
+
+        Private Sub PrintSessionInfo()
+            ' Employee name.
+            PrintLine("Employee: " & ESC_FONT_BOLD & DB.Helper.FormatEmployeeName(Me.EmployeeLogin.EMPLOYEE))
+
+            ' Counter name.
+            PrintLine("Counter: " & ESC_FONT_BOLD & Utilities.CurrentCounter.COMPUTER_NAME)
+
+            ' Login and logout Times.
+            PrintLine("Logged in at: " & ESC_FONT_BOLD & CStr(Me.EmployeeLogin.LOGIN_TIME))
+            PrintLine("Logged out at: " & ESC_FONT_BOLD & CStr(Me.EmployeeLogin.LOGOUT_TIME))
+
+            ' Cash information.
+            PrintLine(ESC_FONT_BOLD & "Cash Drawer Contents")
+            PrintLine(String.Format("At Login: {0}{1:c}", ESC_FONT_BOLD, Me.EmployeeLogin.LOGIN_CASH_AMOUNT))
+            PrintLine(String.Format("Customer Transactions: {0}{1:c}", ESC_FONT_BOLD, Me.EmployeeLogin.LOGOUT_TOTAL_TRANSACTIONS))
+            PrintLine(String.Format("Removed at Logout: {0}{1:c}", ESC_FONT_BOLD, Me.EmployeeLogin.LOGOUT_CASH_REMOVED))
+            PrintLine(String.Format("Left in Drawer: {0}{1:c}", ESC_FONT_BOLD, Me.EmployeeLogin.LOGOUT_CASH_AMOUNT))
+        End Sub
+
+        Private Sub PrintTransactions()
+            ' Customer transactions.
+            Dim cashTotal As Decimal = 0
+            Dim creditTotal As Decimal = 0
+            Dim orderTotal As Decimal = 0
+            For Each trans As DB.SESSION_SUMMARY In Me.Transactions
+                Select Case trans.ACTION_TYPE
+                    Case ACTION_TYPE_CASH
+                        cashTotal += trans.PAYMENT_AMOUNT.GetValueOrDefault(0)
+                    Case ACTION_TYPE_CARD
+                        creditTotal += trans.PAYMENT_AMOUNT.GetValueOrDefault(0)
+                    Case ACTION_TYPE_DROPOFF
+                        orderTotal += trans.PAYMENT_AMOUNT.GetValueOrDefault(0)
+                End Select
+
+                PrintTransaction(trans)
+            Next
+
+
+            ' Removed from drawer.
+            If Me.EmployeeLogin.LOGOUT_TIME.HasValue AndAlso Me.EmployeeLogin.LOGOUT_CASH_REMOVED.HasValue Then
+                PrintLine(Me.EmployeeLogin.LOGOUT_TIME.Value.ToShortTimeString(), _
+                          ESC_FONT_BOLD & "Removed at Logout", _
+                          (-Me.EmployeeLogin.LOGOUT_CASH_REMOVED.Value).ToString("c"))
+            End If
+
+            ' Cash left in drawer.
+            If Me.EmployeeLogin.LOGOUT_TIME.HasValue AndAlso Me.EmployeeLogin.LOGOUT_CASH_AMOUNT.HasValue Then
+                PrintLine(Me.EmployeeLogin.LOGOUT_TIME.Value.ToShortTimeString(), _
+                          ESC_FONT_BOLD & "Left in Drawer", _
+                          Me.EmployeeLogin.LOGOUT_CASH_AMOUNT.Value.ToString("c"))
+            End If
+
+            ' Ending balance.
+            PrintSeparator()
+            PrintLine(String.Empty, _
+                          ESC_FONT_BOLD & "Total Cash Transactions:", _
+                          cashTotal.ToString("c"))
+            PrintLine(String.Empty, _
+                          ESC_FONT_BOLD & "Total Credit Card Transactions:", _
+                          creditTotal.ToString("c"))
+            PrintLine(String.Empty, _
+                          ESC_FONT_BOLD & "Accounts Receivable:", _
+                          (-orderTotal).ToString("c"))
+        End Sub
+
+        Private Sub PrintTransaction(ByVal transaction As DB.SESSION_SUMMARY)
+            Dim time As String = String.Empty
+            time = transaction.ACTION_DATE.ToShortTimeString()
+
+            ' Append action type.
+            time &= " " & transaction.ACTION_TYPE
+
+            Dim orderID As String = String.Empty
+            If transaction.ORDER_ID.HasValue Then
+                orderID = transaction.ORDER_ID.Value.ToString()
+            End If
+
+            Dim amount As String = String.Empty
+            If transaction.PAYMENT_AMOUNT.HasValue Then
+                If transaction.ACTION_TYPE = ACTION_TYPE_DROPOFF Then
+                    amount = (-transaction.PAYMENT_AMOUNT.Value).ToString("c")
+                Else
+                    amount = transaction.PAYMENT_AMOUNT.Value.ToString("c")
+                End If
+            End If
+
+            PrintLine(time, orderID, amount)
+        End Sub
+    End Class
+End Namespace

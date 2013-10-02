@@ -1,0 +1,2237 @@
+﻿Imports System.Data
+Imports System.Data.OleDb
+Imports System.IO
+Imports CrystalDecisions.CrystalReports.Engine
+Imports ICSharpCode.SharpZipLib.Zip
+
+Partial Class TaxPayments
+    Inherits System.Web.UI.Page
+    Private Const COMMAND_TIMEOUT As Integer = 600
+
+    Private Enum PaymentTypeEnum
+        Cash
+        Check
+        CreditCard
+        Creditron
+    End Enum
+
+    Protected Sub Page_Load(sender As Object, e As System.EventArgs) Handles Me.Load
+        If Not Me.IsPostBack Then
+            LoadParameters()
+            PrepareControls()
+            LoadLoginInfo()
+
+            Me.txtPaymentDate.Text = Date.Today.ToShortDateString()
+            Me.TaxRollMaster = Nothing
+
+            BindPendingPaymentsGrids()
+            BindApportionsGrid()
+            BindLettersGrid()
+        End If
+    End Sub
+
+    Public Shared Function GetDatabaseUserName(ByVal connectionString As String) As String
+        Dim builder As New OleDb.OleDbConnectionStringBuilder(connectionString)
+        Return CStr(builder("User ID"))
+    End Function
+    Public Shared Function GetDatabasePassword(ByVal connectionString As String) As String
+        Dim builder As New OleDb.OleDbConnectionStringBuilder(connectionString)
+        Return CStr(builder("Password"))
+    End Function
+
+    ''' <summary>
+    ''' Loads system parameter values from tblTaxSystemParameters.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub LoadParameters()
+        Using conn As New OleDbConnection(Me.ConnectString)
+            ' Minimum Amount to Refund
+            Dim cmd As New OleDbCommand("select FieldData from genii_user.tblTaxSystemParameters where FieldName='MinimumAmountToRefund'", conn)
+            conn.Open()
+            Dim minimumRefundAmount As Object = cmd.ExecuteScalar()
+            If IsNumeric(minimumRefundAmount) Then
+                Me.hdnMinimumRefundAmount.Value = CDec(minimumRefundAmount)
+            Else
+                Me.hdnMinimumRefundAmount.Value = Short.MaxValue
+            End If
+        End Using
+    End Sub
+
+    Private Sub PrepareControls()
+        ' Payment types.
+        Using adt As New OleDbDataAdapter("select PaymentTypeCode, PaymentDescription from genii_user.ST_PAYMENT_INSTRUMENT where SHOW_CASHIER=1", _
+                                          Me.ConnectString)
+            adt.SelectCommand.Connection.Open()
+            Dim rdr As OleDbDataReader = adt.SelectCommand.ExecuteReader()
+            While rdr.Read()
+                Me.ddlPaymentType.Items.Add(New ListItem(rdr.Item("PaymentDescription").ToString(), rdr.Item("PaymentTypeCode")))
+            End While
+        End Using
+    End Sub
+
+    ''' <summary>
+    ''' Loads existing user session if available. Calls StartNewSession() if not.
+    ''' </summary>
+    ''' <remarks>
+    ''' Labels displaying session information are filled here.
+    ''' </remarks>
+    Private Sub LoadLoginInfo()
+        ' Look for existing session.
+        Dim userName As String = Me.CurrentUserName
+        Dim loginTime As Date, startCash As Decimal
+        Dim sqlGetSession As String = "select * from genii_user.CASHIER_SESSION where CASHIER=? and END_TIME is null order by START_TIME desc"
+        Using adt As New OleDbDataAdapter(sqlGetSession, Me.ConnectString)
+            adt.SelectCommand.Parameters.AddWithValue("@CASHIER", userName)
+            Dim dt As New DataTable()
+            adt.Fill(dt)
+            If dt.Rows.Count = 0 Then
+                StartNewSession()
+            Else
+                SessionRecordID = dt.Rows(0)("RECORD_ID")
+                loginTime = dt.Rows(0)("START_TIME")
+                startCash = dt.Rows(0)("START_CASH")
+
+                ' Header
+                Me.lblOperatorName.Text = userName
+                Me.lblCurrentDate.Text = Date.Today.ToShortDateString()
+                Me.lblLoginTime.Text = loginTime.ToString("g")
+                Me.lblStartCash.Text = startCash.ToString("C")
+                Me.lblLogoutUsername.Text = userName
+
+                ' Pending payments tab
+                Me.lblPendCashier.Text = userName
+                Me.lblPendLogin.Text = loginTime.ToString()
+            End If
+        End Using
+
+    End Sub
+
+    ''' <summary>
+    ''' Prepares the logout dialog by filling in available cash in register.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub LoadLogoutInfo()
+        ' Get cash in register.
+        Dim startCash As Decimal
+        If IsNumeric(Me.lblStartCash.Text) Then
+            startCash = CDec(Me.lblStartCash.Text)
+        Else
+            startCash = 0
+        End If
+        Dim cashTransactions As Object = Me.CashierTransactionsTable().Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=2")
+        If IsNumeric(cashTransactions) Then
+            startCash = startCash + CDec(cashTransactions)
+        End If
+        Me.txtLogoutEndCash.Text = startCash.ToString()
+        Me.lblPendCashBoxBalance.Text = startCash.ToString("C")
+    End Sub
+
+    ''' <summary>
+    ''' Prepares login dialog by filling in cash left in register in last session.
+    ''' Login dialog is then opened.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub StartNewSession()
+        ' Get cash in register.
+        Dim userName As String = Me.CurrentUserName
+        Using conn As New OleDbConnection(Me.ConnectString)
+            Dim cmd As New OleDbCommand()
+            cmd.CommandText = "select top 1 END_CASH from genii_user.CASHIER_SESSION where CASHIER=? order by END_TIME desc"
+            cmd.Connection = conn
+            cmd.Parameters.AddWithValue("@CASHIER", userName)
+
+            conn.Open()
+            Dim startCash As Object = cmd.ExecuteScalar()
+            If IsNumeric(startCash) Then
+                Me.txtLoginStartCash.Text = startCash
+            Else
+                Me.txtLoginStartCash.Text = String.Empty
+            End If
+        End Using
+
+        Me.lblLoginUsername.Text = userName
+        ClientScript.RegisterStartupScript(Me.GetType, "Login", "$(document).ready(function() { showLoginDialog(); });", True)
+    End Sub
+
+    ''' <summary>
+    ''' Creates a new user session by adding a row in CASHIER_SESSION table.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub CreateNewSession()
+        Dim userName As String = Me.CurrentUserName
+        Dim startCash As Decimal = CDec(Me.txtLoginStartCash.Text)
+
+        Using conn As New OleDbConnection(Me.ConnectString)
+            conn.Open()
+            Dim trans As OleDbTransaction = conn.BeginTransaction(IsolationLevel.Serializable)
+            Try
+                ' Get new record id.
+                Dim recordID As Integer = GetNewID("RECORD_ID", "genii_user.CASHIER_SESSION", conn, trans)
+
+                ' Create new record.
+                Dim cmdNewRec As New OleDbCommand("insert into genii_user.CASHIER_SESSION " & _
+                                                  "(RECORD_ID, CASHIER, COMPUTER_ID, START_TIME, START_CASH) " & _
+                                                  " values (?,?,?,?,?)")
+                cmdNewRec.Connection = conn
+                cmdNewRec.Transaction = trans
+                With cmdNewRec.Parameters
+                    .AddWithValue("@RECORD_ID", recordID)
+                    .AddWithValue("@CASHIER", userName)
+                    .AddWithValue("@COMPUTER_ID", Request.UserHostName)
+                    .AddWithValue("@START_TIME", Date.Now)
+                    .AddWithValue("@START_CASH", startCash)
+                End With
+                cmdNewRec.ExecuteNonQuery()
+
+                SessionRecordID = recordID
+                Me.lblOperatorName.Text = userName
+                Me.lblCurrentDate.Text = Date.Today.ToShortDateString()
+                Me.lblLoginTime.Text = Date.Now.ToString()
+                Me.lblStartCash.Text = startCash.ToString("C")
+                Me.lblLogoutUsername.Text = userName
+
+                trans.Commit()
+            Catch ex As Exception
+                trans.Rollback()
+                Throw ex
+            End Try
+
+
+        End Using
+    End Sub
+
+    ''' <summary>
+    ''' Logs out user by adding END_TIME in the CASHIER_SESSION table.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub DoLogout()
+        Dim endCash As Decimal = Me.txtLogoutEndCash.Text
+        Using conn As New OleDbConnection(Me.ConnectString)
+            Dim cmd As New OleDbCommand("update genii_user.CASHIER_SESSION set END_TIME=?, END_CASH=? where RECORD_ID=?")
+            cmd.Connection = conn
+            cmd.Parameters.AddWithValue("@END_TIME", Date.Now)
+            cmd.Parameters.AddWithValue("@END_CASH", endCash)
+            cmd.Parameters.AddWithValue("@RECORD_ID", Me.SessionRecordID)
+
+            conn.Open()
+            cmd.ExecuteNonQuery()
+            Me.SessionRecordID = 0
+
+            ' Prompt to start new session?
+            StartNewSession()
+        End Using
+    End Sub
+
+    ''' <summary>
+    ''' Gets new value for column from datatable.
+    ''' </summary>
+    ''' <param name="columnName"></param>
+    ''' <param name="table"></param>
+    ''' <param name="rowFilter"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private Function GetNewID(columnName As String, table As DataTable, _
+                              Optional rowFilter As String = Nothing) As Integer
+        Dim newID As Object = table.Compute(String.Format("MAX({0})", columnName), rowFilter)
+        If IsNumeric(newID) Then
+            Return CInt(newID) + 1
+        Else
+            Return 1
+        End If
+    End Function
+
+    ''' <summary>
+    ''' Gets new value for column from database.
+    ''' </summary>
+    ''' <param name="columnName"></param>
+    ''' <param name="tableName"></param>
+    ''' <param name="connection"></param>
+    ''' <param name="transaction"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private Function GetNewID(columnName As String, tableName As String, _
+                              Optional connection As OleDbConnection = Nothing, _
+                              Optional transaction As OleDbTransaction = Nothing) As Integer
+
+        If connection Is Nothing Then
+            connection = New OleDbConnection(Me.ConnectString)
+        End If
+
+        Dim cmd As New OleDbCommand(String.Format("select MAX({0}) from {1}", columnName, tableName))
+        cmd.Connection = connection
+        If transaction IsNot Nothing Then
+            cmd.Transaction = transaction
+        End If
+
+        Dim newID As Object = cmd.ExecuteScalar()
+        If IsNumeric(newID) Then
+            Return CInt(newID) + 1
+        Else
+            Return 1
+        End If
+    End Function
+
+
+    Private Sub UpdateRecordIds(table As DataTable, tableName As String, columnName As String, _
+                                ByVal connection As OleDbConnection, ByVal transaction As OleDbTransaction)
+        Dim recordID As Integer = GetNewID(columnName, tableName, connection, transaction)
+        For Each row As DataRow In table.Select(String.Empty, String.Empty, _
+                                                DataViewRowState.Added)
+            row(columnName) = recordID
+            recordID += 1
+        Next
+    End Sub
+
+
+    Private Sub CommitTable(table As DataTable, tableName As String, _
+                            ByVal connection As OleDbConnection, ByVal transaction As OleDbTransaction)
+        Using adt As New OleDbDataAdapter(String.Format("select * from {0}", tableName), connection)
+            adt.SelectCommand.Transaction = transaction
+            Dim bld As New OleDbCommandBuilder(adt)
+            adt.UpdateCommand = bld.GetUpdateCommand()
+            adt.InsertCommand = bld.GetInsertCommand()
+            adt.DeleteCommand = bld.GetDeleteCommand()
+            adt.UpdateCommand.Transaction = transaction
+            adt.InsertCommand.Transaction = transaction
+            adt.DeleteCommand.Transaction = transaction
+
+            adt.Update(table)
+        End Using
+    End Sub
+
+    Private Sub CommitDataset()
+        Using conn As New OleDbConnection(Me.ConnectString)
+            conn.Open()
+            Dim trans As OleDbTransaction = conn.BeginTransaction(IsolationLevel.Serializable)
+
+            Try
+                ' Update record ids of new rows to avoid concurrency issues.
+                UpdateRecordIds(Me.DeclinedPaymentsTable, "genii_user.PAYMENT_DECLINED", _
+                                "RECORD_ID", conn, trans)
+                UpdateRecordIds(Me.CashierTransactionsTable, "genii_user.CASHIER_TRANSACTIONS", _
+                                "RECORD_ID", conn, trans)
+                UpdateRecordIds(Me.ApportionDetailsTable, "genii_user.TAX_APPORTION", _
+                                "RECORD_ID", conn, trans)
+
+                ' Commit tables.
+                CommitTable(Me.DeclinedPaymentsTable, "genii_user.PAYMENT_DECLINED", conn, trans)
+                CommitTable(Me.CashierTransactionsTable, "genii_user.CASHIER_TRANSACTIONS", conn, trans)
+                CommitTable(Me.ApportionDetailsTable, "genii_user.TAX_APPORTION", conn, trans)
+
+                trans.Commit()
+            Catch ex As Exception
+                trans.Rollback()
+                Throw ex
+            End Try
+        End Using
+    End Sub
+
+    Private _sessionDataset As DataSet
+    ''' <summary>
+    ''' Loads session, transactions and apportion tables for current session.
+    ''' </summary>
+    ''' <param name="reload">
+    ''' If true, all tables are reloaded from database.
+    ''' </param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private Property SessionDataset(Optional reload As Boolean = False) As DataSet
+        Get
+            If reload OrElse _sessionDataset Is Nothing Then
+                _sessionDataset = New DataSet
+            End If
+
+            ' Load tables.
+            If reload OrElse _sessionDataset.Tables("CASHIER_SESSION") Is Nothing Then
+                LoadTable(_sessionDataset, "CASHIER_SESSION", "select * from genii_user.CASHIER_SESSION where RECORD_ID=" & Me.SessionRecordID)
+            End If
+
+            If reload OrElse _sessionDataset.Tables("PAYMENT_DECLINED") Is Nothing Then
+                LoadTable(_sessionDataset, "PAYMENT_DECLINED", "select * from genii_user.PAYMENT_DECLINED where SESSION_ID=" & Me.SessionRecordID)
+            End If
+
+            If reload OrElse _sessionDataset.Tables("CASHIER_TRANSACTIONS") Is Nothing Then
+                LoadTable(_sessionDataset, "CASHIER_TRANSACTIONS", "select * from genii_user.CASHIER_TRANSACTIONS where SESSION_ID=" & Me.SessionRecordID)
+            End If
+
+            If reload OrElse _sessionDataset.Tables("TAX_APPORTION") Is Nothing Then
+                LoadTable(_sessionDataset, "TAX_APPORTION", _
+                          "select TA.* from genii_user.TAX_APPORTION TA, genii_user.CASHIER_TRANSACTIONS CT " & _
+                          "where TA.TRANS_ID=CT.RECORD_ID and CT.SESSION_ID=" & Me.SessionRecordID)
+            End If
+
+            ' Set relations.
+            AddRelation(_sessionDataset, "CASHIER_SESSION", "RECORD_ID", "PAYMENT_DECLINED", "SESSION_ID")
+            AddRelation(_sessionDataset, "CASHIER_SESSION", "RECORD_ID", "CASHIER_TRANSACTIONS", "SESSION_ID")
+            AddRelation(_sessionDataset, "CASHIER_TRANSACTIONS", "RECORD_ID", "TAX_APPORTION", "TRANS_ID")
+
+            Return _sessionDataset
+        End Get
+        Set(value As DataSet)
+            _sessionDataset = value
+        End Set
+    End Property
+
+    ''' <summary>
+    ''' Adds relation between two tables. Helper function for <see cref="SessionDataset">SessionDataset</see>.
+    ''' </summary>
+    ''' <param name="container"></param>
+    ''' <param name="parentTable"></param>
+    ''' <param name="parentColumn"></param>
+    ''' <param name="childTable"></param>
+    ''' <param name="childColumn"></param>
+    ''' <remarks></remarks>
+    Private Sub AddRelation(container As DataSet, parentTable As String, parentColumn As String, _
+                            childTable As String, childColumn As String)
+        Dim relName As String = String.Format("{0}-{1}", parentTable, childTable)
+        If Not container.Relations.Contains(relName) Then
+            Dim rel As New DataRelation(relName, container.Tables(parentTable).Columns(parentColumn), _
+                                        container.Tables(childTable).Columns(childColumn))
+            container.Relations.Add(rel)
+
+            rel.ChildKeyConstraint.DeleteRule = Rule.None
+            rel.ChildKeyConstraint.UpdateRule = Rule.Cascade
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' Loads table from database into dataset. Helper function for <see cref="SessionDataset">SessionDataset</see>.
+    ''' </summary>
+    ''' <param name="container"></param>
+    ''' <param name="tableName"></param>
+    ''' <param name="query"></param>
+    ''' <remarks></remarks>
+    Private Sub LoadTable(container As DataSet, tableName As String, query As String)
+        Using adt As New OleDbDataAdapter(query, Me.ConnectString)
+            adt.Fill(container, tableName)
+        End Using
+    End Sub
+
+    ''' <summary>
+    ''' Returns CASHIER_SESSION table with row for current session.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private ReadOnly Property SessionTable As DataTable
+        Get
+            Return SessionDataset().Tables("CASHIER_SESSION")
+        End Get
+    End Property
+
+    ''' <summary>
+    ''' Returns CASHIER_SESSION row for current session.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private ReadOnly Property SessionRow As DataRow
+        Get
+            If Me.SessionTable.Rows.Count >= 1 Then
+                Return Me.SessionTable.Rows(0)
+            Else
+                Throw New InvalidOperationException("Session not started")
+            End If
+        End Get
+    End Property
+
+    ''' <summary>
+    ''' CASHIER_TRANSACTIONS table.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private ReadOnly Property CashierTransactionsTable() As DataTable
+        Get
+            Return SessionDataset().Tables("CASHIER_TRANSACTIONS")
+        End Get
+    End Property
+
+    ''' <summary>
+    ''' PAYMENT_DECLINED table.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private ReadOnly Property DeclinedPaymentsTable As DataTable
+        Get
+            Return SessionDataset().Tables("PAYMENT_DECLINED")
+        End Get
+    End Property
+
+    ''' <summary>
+    ''' Loads tax roll and fills in tax roll information.
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    ''' <remarks></remarks>
+    Protected Sub btnFindTaxInfo_Click(sender As Object, e As System.EventArgs) Handles btnFindTaxInfo.Click
+        LoadTaxInfo()
+
+        Me.pnlLetterQueuer.Visible = False
+        If Me.TaxRollMaster.IsLoaded() Then
+            LoadData()
+            BindTaxRollInfoGrids()
+
+            Me.txtCheckNumber.Text = String.Empty
+            Me.btnSavePayment.Enabled = True
+        Else
+            ClientScript.RegisterStartupScript(Me.GetType(), "TaxRollNotFound", "showMessage('Tax roll not found.', 'Not Found');", True)
+            Me.btnSavePayment.Enabled = False
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' Gets or sets current session id.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private Property SessionRecordID As Integer
+        Get
+            Return GetSessionVariable("SessionRecordID")
+        End Get
+        Set(value As Integer)
+            SetSessionVariable("SessionRecordID", value)
+            Me.hdnSessionRecordID.Value = value
+            Me.SessionDataset = Nothing
+        End Set
+    End Property
+
+    ''' <summary>
+    ''' Gets connection string for NCIS_TREASURY database.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private ReadOnly Property ConnectString As String
+        Get
+            Return ConfigurationManager.ConnectionStrings("ConnString").ConnectionString
+        End Get
+    End Property
+
+    Private Shared ReadOnly Property CurrentUserName As String
+        Get
+            Dim UserName As String
+            Dim SlashPos As Integer
+
+            SlashPos = InStr(Environment.UserName, "\")
+
+            If SlashPos > 0 Then
+                UserName = Mid(Environment.UserName, SlashPos + 1)
+            Else
+                UserName = Environment.UserName
+            End If
+
+            Return UserName
+        End Get
+    End Property
+
+    Private Const TAX_ROLL_MASTER_SESS_ID As String = "TaxRollMaster"
+    ''' <summary>
+    ''' Gets or sets TaxRollMasterClass object for tax roll that was last searched for.
+    ''' Object is stored in ASP .NET session.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private Property TaxRollMaster As TaxRollMasterClass
+        Get
+            Dim obj As Object = Session(TAX_ROLL_MASTER_SESS_ID)
+            If obj Is Nothing OrElse Not TypeOf obj Is TaxRollMasterClass Then
+                Dim trm As New TaxRollMasterClass(Me.ConnectString)
+                Session.Add(TAX_ROLL_MASTER_SESS_ID, trm)
+                Return trm
+            Else
+                Return DirectCast(obj, TaxRollMasterClass)
+            End If
+        End Get
+        Set(value As TaxRollMasterClass)
+            If Session(TAX_ROLL_MASTER_SESS_ID) IsNot Nothing Then
+                Session.Remove(TAX_ROLL_MASTER_SESS_ID)
+            End If
+            If value IsNot Nothing Then
+                Session.Add(TAX_ROLL_MASTER_SESS_ID, value)
+            End If
+        End Set
+    End Property
+
+    ''' <summary>
+    ''' TAX_APPORTION table.
+    ''' </summary>
+    ''' <value></value>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Private ReadOnly Property ApportionDetailsTable As DataTable
+        Get
+            Return SessionDataset.Tables("TAX_APPORTION")
+        End Get
+    End Property
+
+    Private Function GetSessionVariable(variableName As String) As Object
+        Return Session(variableName)
+    End Function
+
+    Private Sub SetSessionVariable(variableName As String, value As Object)
+        Session.Add(variableName, value)
+    End Sub
+
+    ''' <summary>
+    ''' Gets formatted yes/no value. 1 is "yes", all others "no".
+    ''' </summary>
+    ''' <param name="value"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Protected Function GetYesNo(value As Object) As String
+        If IsNumeric(value) AndAlso CInt(value) = 1 Then
+            Return "Yes"
+        Else
+            Return "No"
+        End If
+    End Function
+
+    Private _tblPaymentType As DataTable
+    Private ReadOnly Property PaymentTypeTable As DataTable
+        Get
+            If _tblPaymentType Is Nothing Then
+                _tblPaymentType = New DataTable()
+                Using adt As New OleDbDataAdapter("select * from genii_user.ST_PAYMENT_INSTRUMENT", Me.ConnectString)
+                    adt.Fill(_tblPaymentType)
+                End Using
+            End If
+
+            Return _tblPaymentType
+        End Get
+    End Property
+
+    Private Function GetPaymentTypeCode(paymentType As PaymentTypeEnum) As Integer
+        Dim paymentDescription As String = String.Empty
+        Select Case paymentType
+            Case PaymentTypeEnum.Cash
+                paymentDescription = "Cash"
+            Case PaymentTypeEnum.Check
+                paymentDescription = "Check"
+            Case PaymentTypeEnum.CreditCard
+                paymentDescription = "Credit Card"
+            Case PaymentTypeEnum.Creditron
+                paymentDescription = "Scanned Payment"
+        End Select
+
+        Dim rows As DataRow() = Me.PaymentTypeTable.Select(String.Format("PaymentDescription='{0}'", paymentDescription), String.Empty)
+        If rows.Length >= 1 Then
+            Return rows(0)("PaymentTypeCode")
+        Else
+            Return 0
+        End If
+    End Function
+
+    Protected Function CanRedeemCP(status As Object) As Boolean
+        If IsNumeric(status) Then
+            Select Case CInt(status)
+                Case 0, 5, 6, 8
+                    Return False
+                Case 1, 2, 3, 4, 7
+                    Return True
+                Case Else
+                    Return False
+            End Select
+        Else
+            Return False
+        End If
+    End Function
+
+    Protected Function GetCPStatus(status As Object) As String
+        If IsNumeric(status) Then
+            Select Case CInt(status)
+                Case 0
+                    Return "Preparation"
+                Case 1
+                    Return "Purchased"
+                Case 2
+                    Return "Assigned to State"
+                Case 3
+                    Return "Purchased from State"
+                Case 4
+                    Return "Reassigned"
+                Case 5
+                    Return "Redeemed"
+                Case 6
+                    Return "Closed by Deed"
+                Case 7
+                    Return "Expiring"
+                Case 8
+                    Return "Expired"
+                Case Else
+                    Return status.ToString()
+            End Select
+        Else
+            Return status.ToString()
+        End If
+    End Function
+
+    ''' <summary>
+    ''' Gets payment type (cash, check, credit card, etc.).
+    ''' </summary>
+    ''' <param name="paymentType"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Protected Function GetPaymentType(paymentType As Object) As String
+        If IsNumeric(paymentType) Then
+            Dim rows As DataRow() = Me.PaymentTypeTable.Select("PaymentTypeCode=" & paymentType.ToString())
+            If rows.Length >= 1 Then
+                Return rows(0)("PaymentDescription")
+            Else
+                Return paymentType.ToString()
+            End If
+        Else
+            Return String.Empty
+        End If
+    End Function
+
+    Private _tblTaxAuthority As DataTable
+    ''' <summary>
+    ''' Gets tax charge code from ST_TAX_AUTHORITY table.
+    ''' </summary>
+    ''' <param name="taxChargeCodeID"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Protected Function GetChargeCode(taxChargeCodeID As String) As String
+        If _tblTaxAuthority Is Nothing Then
+            Using adt As New OleDbDataAdapter("select TaxChargeCodeID, TaxChargeDescription from genii_user.ST_TAX_AUTHORITY", Me.ConnectString)
+                _tblTaxAuthority = New DataTable()
+                adt.Fill(_tblTaxAuthority)
+            End Using
+        End If
+
+        Dim rows As DataRow() = _tblTaxAuthority.Select(String.Format("TaxChargeCodeID='{0}'", taxChargeCodeID))
+        If rows.Length > 0 Then
+            Return rows(0)("TaxChargeDescription").ToString()
+        Else
+            Return taxChargeCodeID
+        End If
+    End Function
+
+    Private _tblTaxType As DataTable
+    ''' <summary>
+    ''' Gets tax type from ST_TAX_TYPES table.
+    ''' </summary>
+    ''' <param name="taxTypeID"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Protected Function GetTaxType(taxTypeID As String) As String
+        If _tblTaxType Is Nothing Then
+            Using adt As New OleDbDataAdapter("select TaxTypeID, TaxCodeDescription from genii_user.ST_TAX_TYPES", Me.ConnectString)
+                _tblTaxType = New DataTable()
+                adt.Fill(_tblTaxType)
+            End Using
+        End If
+
+        Dim rows As DataRow() = _tblTaxType.Select(String.Format("TaxTypeID='{0}'", taxTypeID))
+        If rows.Length > 0 Then
+            Return rows(0)("TaxCodeDescription").ToString()
+        Else
+            Return taxTypeID
+        End If
+    End Function
+
+    Private _tblTaxDistrict As DataTable
+    ''' <summary>
+    ''' Returns formatted tax area code.
+    ''' </summary>
+    ''' <param name="areaCode"></param>
+    ''' <returns></returns>
+    ''' <remarks></remarks>
+    Protected Function GetTaxArea(areaCode As String) As String
+        If _tblTaxDistrict Is Nothing Then
+            Using adt As New OleDbDataAdapter("select DistrictCode, DistrictName from genii_user.ST_TAX_DISTRICT", Me.ConnectString)
+                _tblTaxDistrict = New DataTable()
+                adt.Fill(_tblTaxDistrict)
+            End Using
+        End If
+
+        If areaCode.Length >= 4 Then
+            Dim districtCode As String = areaCode.Substring(0, 2)
+            Dim rows As DataRow() = _tblTaxDistrict.Select(String.Format("DistrictCode='{0}'", districtCode))
+            If rows.Length > 0 Then
+                Dim area As String = areaCode.Substring(2)
+                Return String.Format("{0} ({1})", rows(0)("DistrictName"), area)
+            End If
+        End If
+
+        Return areaCode
+    End Function
+
+    ''' <summary>
+    ''' Prepare TaxRollMasterClass object with user entered search parameters.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub LoadTaxInfo()
+        Me.TaxRollMaster = Nothing
+        Dim trm As TaxRollMasterClass = Me.TaxRollMaster
+        trm.TaxYear = Me.txtTaxYear.Text
+        If Me.rdoTaxRollNumber.Checked Then
+            trm.TaxRollNumber = Me.txtTaxRollNumber.Text
+        Else
+            trm.APN = Me.txtAPN.Text.Replace("_"c, String.Empty)
+        End If
+        trm.LoadData()
+        Me.TaxRollMaster = trm
+    End Sub
+
+    ''' <summary>
+    ''' Fills in tax information controls for transaction.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub LoadData()
+        Dim paymentDate As Date, firstHalfDue As Date, secondHalfDue As Date
+        paymentDate = CDate(Me.txtPaymentDate.Text)
+        Me.TaxRollMaster.GetDelinquentDates(firstHalfDue, secondHalfDue)
+
+        Dim taxes As Decimal, interest As Decimal, fee As Decimal, payments As Decimal
+        With Me.TaxRollMaster
+            '.RecalculateFees(Me.txtPaymentDate.Text)
+            taxes = .GetTaxes()
+            .GetInterestAndFee(Me.txtPaymentDate.Text, interest, fee)
+            payments = .GetTotalPayments()
+
+            taxes = Decimal.Round(taxes, 2)
+            interest = Decimal.Round(interest, 2)
+            fee = Decimal.Round(fee, 2)
+            payments = Decimal.Round(payments, 2)
+
+            Me.txtTaxRollNumber.Text = .TaxRollNumber
+            Me.txtAPN.Text = .APN
+            Me.txtTotalTaxes.Text = taxes
+            Me.txtTotalInterest.Text = interest
+            Me.txtTotalFees.Text = fee
+            Me.txtTotalPayments.Text = payments
+            Me.txtCalculatedBalance.Text = taxes + interest + fee - payments
+            'Me.txtCalculatedBalance.Text = .CurrentBalance
+            If Me.chkPayBothHalves.Checked Or taxes <= .MaxTaxDueBothHalves Or paymentDate > firstHalfDue Then
+                ' Full taxes due if taxes is less than $100 or first half due date has passed.
+                Me.txtAmountDueNow.Text = Me.txtCalculatedBalance.Text
+            Else
+                ' First half due at this time.
+                Me.txtAmountDueNow.Text = taxes / 2 + interest + fee - payments
+            End If
+            Me.txtPayerName.Text = .OwnerName
+        End With
+
+        ' Difference
+        If IsNumeric(Me.txtAmountDueNow.Text) And IsNumeric(Me.txtAmountPaid.Text) Then
+            Me.txtDifference.Text = (CDbl(Me.txtAmountPaid.Text) - CDbl(Me.txtAmountDueNow.Text)).ToString("+#.00;-#.00;0")
+        End If
+
+        ' Control preparation.
+        Me.btnCreateReceipt.Visible = False
+    End Sub
+
+    ''' <summary>
+    ''' Binds tax roll information grids.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub BindTaxRollInfoGrids()
+        ' Account History tab
+        lblTaxHistoryAccount.Text = Me.TaxRollMaster.APN
+        Dim accountSQL As String = String.Format("SELECT TA.ParcelOrTaxID, TA.APN, ISNULL(CONVERT(varchar(10), TA.STREETNO), '') + ' ' + ISNULL(RMF.STREET_NAME, '') + ' ' + ISNULL(RMF.STREET_TYPE, '') " & _
+            " + ', ' + ISNULL(TA.LOCCITY, '') + ' ' + ISNULL(TA.POSTAL_CODE, '') AS PARCEL_ADDRESS, " & _
+            " CASE ACCOUNT_STATUS WHEN 1 THEN 'Secured - Active' WHEN 2 THEN 'Secured - Merged' WHEN 3 THEN 'Secured - Split' WHEN 4 THEN 'Unsecured - Active' WHEN" & _
+            " 5 THEN 'Unsecured - Closed' WHEN 6 THEN 'Unsecured - Abated' END AS ACCOUNT_STATUS" & _
+            " FROM genii_user.TAX_ACCOUNT AS TA LEFT OUTER JOIN" & _
+            " NCIS.dbo.ROAD_MASTER_FILE AS RMF ON TA.ROAD_NUMBER = RMF.ROAD_NUMBER" & _
+            " WHERE (TA.ParcelOrTaxID = '{0}')", Me.TaxRollMaster.APN.Replace("-", String.Empty))
+        Using adt As New OleDbDataAdapter(accountSQL, Me.ConnectString)
+            Dim tblAccount As New DataTable()
+            adt.Fill(tblAccount)
+            If tblAccount.Rows.Count > 0 Then
+                lblTaxHistoryStatus.Text = tblAccount.Rows(0)("ACCOUNT_STATUS").ToString()
+                lblTaxHistoryAddress.Text = tblAccount.Rows(0)("PARCEL_ADDRESS").ToString()
+            End If
+        End Using
+
+        Dim taxHistorySQL As String = String.Format("SELECT TaxYear AS 'Tax Year', TaxRollNumber AS 'Tax Roll', Status, " & _
+                                                    "ChargeAmount AS 'Taxes', NumPayments AS 'Payments', TotalPaymentAmount AS 'Remitted', " & _
+                                                    " ChargeAmount - TotalPaymentAmount AS 'Balance' " & _
+                                                    " FROM vTaxHistory " & _
+                                                    " WHERE APN = '{0}' " & _
+                                                    " ORDER BY  'Tax Year' DESC", Me.TaxRollMaster.APN)
+        BindGrid(Me.grdTaxHistory, taxHistorySQL)
+
+        ' Payment History tab
+        Dim paymentsSQL As String = String.Format("select TC.TASK_DATE as PaymentDate, TCP.PaymentEffectiveDate, TCP.Pertinent1, TCP.Pertinent2, TCP.PaymentAmount from genii_user.TR_CALENDAR TC inner join genii_user.TR_CALENDAR_PAYMENTS TCP on TC.RECORD_ID = TCP.RECORD_ID where TC.TaxYear='{0}' and TC.TaxRollNumber='{1}'", _
+                                                  Me.TaxRollMaster.TaxYear, Me.TaxRollMaster.TaxRollNumber)
+        BindGrid(Me.grdPaymentHistory, paymentsSQL)
+
+        ' Tax Calculation tab
+        Me.TaxRollMaster.TaxCalculationTable.DefaultView.Sort = "TaxYear DESC, TaxChargeCodeID ASC, TaxTypeID ASC"
+        Me.TaxRollMaster.TaxCalculationTable.DefaultView.RowFilter = "TaxTypeID <= " & Me.TaxRollMaster.MaxTaxTypeID
+        Dim dt As DataTable = Me.TaxRollMaster.TaxCalculationTable.DefaultView.ToTable(False, "TaxYear", "TaxChargeCodeID", "TaxTypeID", "ChargeAmount")
+        dt.Columns("ChargeAmount").ColumnName = "Tax"
+        With Me.grdTaxCalc
+            .DataSource = dt
+            .DataBind()
+        End With
+
+        ' Late Charges tab
+        With Me.grdCharges
+            .DataSource = Me.TaxRollMaster.GetChargesTable()
+            .DataBind()
+        End With
+
+        ' CPs tab
+        Dim cpSQL As String = String.Format("select   TaxYear, TaxRollNumber, InvestorID, InvestorName, CertificateNumber, MonthlyRateOfInterest, FaceValueOfCP, PurchaseValue, CP_STATUS " & _
+                      " from dbo.vTaxCPsIssued where APN='{0}' order by TaxYear", _
+                      Me.TaxRollMaster.APN)
+        BindGrid(Me.grdCPs, cpSQL)
+    End Sub
+
+    ''' <summary>
+    ''' Binds grid with given select command.
+    ''' </summary>
+    ''' <param name="grid"></param>
+    ''' <param name="commandText"></param>
+    ''' <remarks>Helper function</remarks>
+    Private Sub BindGrid(grid As GridView, commandText As String)
+        Dim dt As New DataTable()
+        Using adt As New OleDbDataAdapter(commandText, Me.ConnectString)
+            adt.SelectCommand.CommandTimeout = 300
+            adt.Fill(dt)
+        End Using
+
+        With grid
+            .DataSource = dt
+            .DataBind()
+        End With
+    End Sub
+
+    ''' <summary>
+    ''' Binds the Cashier Session Activity tab.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub BindPendingPaymentsGrids()
+        ' Summary
+        ' Username and login time are bound in LoadLogin()
+        Dim totalPayments As Decimal, totalTax As Decimal, totalRefunds As Decimal, totalKittyFund As Decimal
+        Dim totalCash As Decimal, totalChecks As Decimal, totalCreditCard As Decimal, totalCreditron As Decimal
+        Dim totalMoneyOrder As Decimal, totalOtherPaid As Decimal
+        Dim totalDeclined As Decimal
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", String.Empty).ToString(), totalPayments)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=2").ToString(), totalCash)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=1").ToString(), totalChecks)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=10").ToString(), totalCreditCard)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=4").ToString(), totalCreditron)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=3").ToString(), totalMoneyOrder)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(PAYMENT_AMT)", "PAYMENT_TYPE=5").ToString(), totalOtherPaid)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(TAX_AMT)", String.Empty).ToString(), totalTax)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(REFUND_AMT)", String.Empty).ToString(), totalRefunds)
+        Decimal.TryParse(Me.CashierTransactionsTable.Compute("SUM(KITTY_AMT)", String.Empty).ToString(), totalKittyFund)
+        Decimal.TryParse(Me.DeclinedPaymentsTable.Compute("SUM(DECLINED_AMT)", String.Empty).ToString(), totalDeclined)
+
+        Me.lblPendTransNum.Text = Me.CashierTransactionsTable.Rows.Count + Me.DeclinedPaymentsTable.Rows.Count
+        Me.lblPendPayments.Text = totalPayments.ToString("C")
+        Me.lblPendCash.Text = totalCash.ToString("C")
+        Me.lblPendChecks.Text = totalChecks.ToString("C")
+        Me.lblPendCreditCard.Text = totalCreditCard.ToString("C")
+        Me.lblPendCreditron.Text = totalCreditron.ToString("C")
+        Me.lblPendMoneyOrder.Text = totalMoneyOrder.ToString("C")
+        Me.lblPendOtherPaid.Text = totalOtherPaid.ToString("C")
+        Me.lblPendTax.Text = totalTax.ToString("C")
+        Me.lblPendRefunds.Text = totalRefunds.ToString("C")
+        Me.lblPendKittyFund.Text = totalKittyFund.ToString("C")
+        Me.lblPendDeclined.Text = totalDeclined.ToString("C")
+        Me.lblPendAllocatedTotal.Text = (totalTax + totalRefunds + totalKittyFund + totalDeclined).ToString("C")
+        Me.lblPendDifference.Text = (totalPayments - (totalTax + totalRefunds + totalKittyFund + totalDeclined)).ToString("C")
+
+        ' Pending payments
+        Me.grdPendingPayments.DataSource = Me.CashierTransactionsTable()
+        Me.grdPendingPayments.DataBind()
+        Me.lblTotalPendingPayments.Text = totalPayments.ToString("C")
+
+        ' Declined payments
+        Me.grdDeclinedPayments.DataSource = Me.DeclinedPaymentsTable
+        Me.grdDeclinedPayments.DataBind()
+
+        ' Tax payments
+        Dim TaxView As New DataView(Me.CashierTransactionsTable())
+        TaxView.RowFilter = "TAX_AMT <> 0"
+        Me.grdPendingTax.DataSource = TaxView
+        Me.grdPendingTax.DataBind()
+
+        ' Refunds
+        Dim RefundsView As New DataView(Me.CashierTransactionsTable())
+        RefundsView.RowFilter = "REFUND_AMT <> 0"
+        Me.grdRefunds.DataSource = RefundsView
+        Me.grdRefunds.DataBind()
+
+        ' Kitty Fund
+        Dim KittyView As New DataView(Me.CashierTransactionsTable())
+        KittyView.RowFilter = "KITTY_AMT <> 0"
+        Me.grdKittyFunds.DataSource = KittyView
+        Me.grdKittyFunds.DataBind()
+    End Sub
+
+    ''' <summary>
+    ''' Binds the Closeout tab.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub BindApportionsGrid()
+        Me.grdApportionments.DataSource = Me.ApportionDetailsTable
+        Me.grdApportionments.DataBind()
+        Dim objTotalApportions As Object = If(Me.ApportionDetailsTable.Columns.Contains("DollarAmount"), _
+                                              Me.ApportionDetailsTable.Compute("SUM(DollarAmount)", String.Empty), _
+                                              Nothing)
+        If IsNumeric(objTotalApportions) Then
+            Me.lblTotalApportionment.Text = CDec(objTotalApportions).ToString("C")
+        Else
+            Me.lblTotalApportionment.Text = String.Empty
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' Saves cashier transaction in database.
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    ''' <remarks></remarks>
+    Protected Sub btnSavePayment_Click(sender As Object, e As System.EventArgs) Handles btnSavePayment.Click
+        Dim paymentAmount As Decimal = GetDecimalOrZero(Me.txtAmountPaid.Text)
+        Dim taxAmount As Decimal = GetDecimalOrZero(Me.txtAmountDueNow.Text)
+        Dim txtDiff As Decimal = GetDecimalOrZero(Me.txtDifference.Text)
+        Dim diff As Decimal = paymentAmount - taxAmount
+        If diff <> txtDiff Then
+            ClientScript.RegisterStartupScript(Me.GetType(), "DiffChanged", "showMessage('Amount Paid, Amount Due or Difference is not correct. Please check values and try again.', 'Retry');", True)
+            Exit Sub
+        End If
+
+        Select Case diff
+            Case 0
+                SaveAcceptedPayment(taxAmount, 0, 0)
+
+            Case Is > 0
+                Select Case Me.rdoAmountOver.SelectedValue
+                    Case "decline"
+                        SaveDeclinedPayment()
+                    Case "refund"
+                        SaveAcceptedPayment(taxAmount, 0, paymentAmount - taxAmount)
+                    Case "kitty"
+                        SaveAcceptedPayment(taxAmount, paymentAmount - taxAmount, 0)
+                    Case Else
+                        Throw New NotImplementedException(Me.rdoAmountOver.SelectedItem.Text)
+                End Select
+            Case Is < 0
+                Select Case Me.rdoAmountUnder.SelectedValue
+                    Case "decline"
+                        SaveDeclinedPayment()
+                    Case "partial"
+                        SaveAcceptedPayment(paymentAmount, 0, 0)
+                    Case "writeoff"
+                        SaveAcceptedPayment(taxAmount, paymentAmount - taxAmount, 0)
+                    Case Else
+                        Throw New NotImplementedException(Me.rdoAmountUnder.SelectedItem.Text)
+                End Select
+        End Select
+
+        Me.txtBarcode.Text = String.Empty
+        Me.btnSavePayment.Enabled = False
+        Me.btnCreateReceipt.Visible = True
+        ShowLetterQueuer(-diff)
+
+        BindPendingPaymentsGrids()
+    End Sub
+
+    Private Function GetDecimalOrZero(value As String) As Decimal
+        If String.IsNullOrEmpty(value) OrElse Not IsNumeric(value) Then
+            Return 0
+        Else
+            Return CDec(value)
+        End If
+    End Function
+
+    Private Function GetDecimalOrDBNull(value As String) As Object
+        If String.IsNullOrEmpty(value) OrElse Not IsNumeric(value) Then
+            Return DBNull.Value
+        Else
+            Return CDec(value)
+        End If
+    End Function
+
+    ''' <summary>
+    ''' Saves declined payment in database.
+    ''' </summary>
+    ''' <remarks>PAYMENT_DECLINED table.</remarks>
+    Private Sub SaveDeclinedPayment()
+        ' Add payment information to PAYMENT_DECLINED table.
+        Dim row As DataRow = Me.DeclinedPaymentsTable.NewRow()
+        row("SESSION_ID") = Me.SessionRecordID
+        row("TAX_YEAR") = Me.txtTaxYear.Text
+        row("TAX_ROLL_NUMBER") = Me.txtTaxRollNumber.Text
+        row("PAYMENT_DATE") = Me.txtPaymentDate.Text
+        row("PAYMENT_TYPE") = Me.ddlPaymentType.SelectedValue
+        If Me.ddlPaymentType.SelectedValue = 2 Then
+            row("CHECK_NUMBER") = Me.txtCheckNumber.Text
+        End If
+        row("DECLINED_AMT") = GetDecimalOrDBNull(Me.txtAmountPaid.Text)
+        row("PAYOR_NAME") = Me.txtPayerName.Text
+        row("BARCODE") = Me.txtBarcode.Text
+        row("EDIT_USER") = Me.CurrentUserName
+        row("EDIT_DATE") = Date.Now
+        row("CREATE_USER") = Me.CurrentUserName
+        row("CREATE_DATE") = Date.Now
+        Me.DeclinedPaymentsTable.Rows.Add(row)
+
+        CommitDataset()
+    End Sub
+
+    ''' <summary>
+    ''' Saves accepted payment in database.
+    ''' </summary>
+    ''' <param name="taxAmount"></param>
+    ''' <param name="kittyAmount"></param>
+    ''' <param name="refundAmount"></param>
+    ''' <remarks>CASHIER_TRANSACTIONS table.</remarks>
+    Private Sub SaveAcceptedPayment(taxAmount As Decimal, kittyAmount As Decimal, refundAmount As Decimal)
+        ' Add payment information to CASHIER_TRANSACTION table.
+        Dim row As DataRow = Me.CashierTransactionsTable.NewRow()
+        row("SESSION_ID") = Me.SessionRecordID
+        row("TAX_YEAR") = Me.txtTaxYear.Text
+        row("TAX_ROLL_NUMBER") = Me.txtTaxRollNumber.Text
+        row("PAYMENT_DATE") = Me.txtPaymentDate.Text
+        row("PAYMENT_TYPE") = Me.ddlPaymentType.SelectedValue
+        row("PAYOR_NAME") = Me.txtPayerName.Text
+        If Me.ddlPaymentType.SelectedValue = 2 Then
+            row("CHECK_NUMBER") = Me.txtCheckNumber.Text
+        End If
+        row("BARCODE") = Me.txtBarcode.Text
+        row("PAYMENT_AMT") = GetDecimalOrDBNull(Me.txtAmountPaid.Text)
+        row("TAX_AMT") = taxAmount
+        row("KITTY_AMT") = kittyAmount
+        row("REFUND_AMT") = refundAmount
+        row("EDIT_USER") = Me.CurrentUserName
+        row("EDIT_DATE") = Date.Now
+        row("CREATE_USER") = Me.CurrentUserName
+        row("CREATE_DATE") = Date.Now
+        Me.CashierTransactionsTable.Rows.Add(row)
+
+        CommitDataset()
+    End Sub
+
+    ''' <summary>
+    ''' Calculates apportion detail for every non-apportioned session transaction.
+    ''' </summary>
+    ''' <remarks></remarks>
+    Private Sub CalculateApportionments()
+        Using conn As New OleDbConnection(Me.ConnectString)
+            conn.Open()
+
+            ' Call GetApportionment SQL function for each payment.
+            Dim taxYear As Integer, taxRollNumber As String, _
+                paymentAmount As Decimal, paymentDate As Date
+            Me.ApportionDetailsTable.Clear()
+            For Each payRow As DataRow In Me.CashierTransactionsTable.Select("IS_APPORTIONED is null or IS_APPORTIONED <> 1")
+                taxYear = payRow("TAX_YEAR")
+                taxRollNumber = payRow("TAX_ROLL_NUMBER")
+                paymentAmount = payRow("TAX_AMT")
+                paymentDate = payRow("PAYMENT_DATE")
+
+                Dim cmd As New OleDbCommand("select * from NCIS_TREASURY.dbo.GetApportionment(?,?,?,?)", conn)
+                cmd.Parameters.AddWithValue("@TaxYear", taxYear)
+                cmd.Parameters.AddWithValue("@TaxRollNumber", taxRollNumber)
+                cmd.Parameters.AddWithValue("@PaymentAmount", paymentAmount)
+                cmd.Parameters.AddWithValue("@PaymentDate", paymentDate)
+
+                Dim rdr As OleDbDataReader = cmd.ExecuteReader()
+                While rdr.Read()
+                    Dim row As DataRow = Me.ApportionDetailsTable.NewRow()
+                    row("RECORD_ID") = GetNewID("RECORD_ID", Me.ApportionDetailsTable)
+                    row("TRANS_ID") = payRow("RECORD_ID")
+                    row("TaxYear") = rdr.Item("TaxYear")
+                    row("TaxRollNumber") = rdr.Item("TaxRollNumber")
+                    row("AreaCode") = rdr.Item("AreaCode")
+                    row("TaxChargeCodeID") = rdr.Item("TaxChargeCodeID")
+                    row("TaxTypeID") = rdr.Item("TaxTypeID")
+                    row("PaymentDate") = rdr.Item("PaymentDate")
+                    row("GLAccount") = rdr.Item("GLAccount")
+                    row("SentToOtherSystem") = rdr.Item("SentToOtherSystem")
+                    row("ReceiptNumber") = rdr.Item("ReceiptNumber")
+                    row("DateApportioned") = rdr.Item("DateApportioned")
+                    row("DollarAmount") = rdr.Item("DollarAmount")
+                    row("EDIT_USER") = Me.SessionRow("CASHIER").ToString()
+                    row("EDIT_DATE") = Date.Now
+                    row("CREATE_USER") = Me.SessionRow("CASHIER").ToString()
+                    row("CREATE_DATE") = Date.Now
+
+                    Me.ApportionDetailsTable.Rows.Add(row)
+                End While
+
+                payRow("IS_APPORTIONED") = 1
+            Next
+        End Using
+
+        CommitDataset()
+        BindPendingPaymentsGrids()
+        BindApportionsGrid()
+    End Sub
+
+    Protected Sub btnClearPendingPayments_Click(sender As Object, e As System.EventArgs) Handles btnClearPendingPayments.Click
+        ClearPendingPayments()
+    End Sub
+
+    Protected Sub btnApportionment_Click(sender As Object, e As System.EventArgs) Handles btnCreateApportionment.Click
+        CalculateApportionments()
+    End Sub
+
+    <Obsolete("Is this used?", False)> _
+    Private Sub ClearPaymentTable(tableName As String, connection As OleDbConnection, transaction As OleDbTransaction)
+        Dim cmd As New OleDbCommand(String.Format("delete from {0} where SESSION_ID=?", tableName), connection)
+        If transaction IsNot Nothing Then
+            cmd.Transaction = transaction
+        End If
+        cmd.Parameters.AddWithValue("@SESSION_ID", Me.SessionRecordID)
+        cmd.ExecuteNonQuery()
+    End Sub
+
+    <Obsolete("Is this used?", False)> _
+    Private Sub ClearPendingPayments()
+        ' Delete from database.
+        Using conn As New OleDbConnection(Me.ConnectString)
+            conn.Open()
+            Dim trans As OleDbTransaction = conn.BeginTransaction
+            Try
+                ClearPaymentTable("genii_user.CASHIER_TRANSACTIONS", conn, trans)
+                ClearPaymentTable("genii_user.PAYMENT_ADJUST", conn, trans)
+                ClearPaymentTable("genii_user.PAYMENT_DECLINED", conn, trans)
+                ClearPaymentTable("genii_user.PAYMENT_REFUND", conn, trans)
+
+                trans.Commit()
+            Catch ex As Exception
+                trans.Rollback()
+                Throw ex
+            End Try
+        End Using
+
+        ' Clear variables.
+        Me.SessionDataset = Nothing
+
+        ' Bind grid.
+        BindPendingPaymentsGrids()
+    End Sub
+
+    ''' <summary>
+    ''' Saves payments in database.
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    ''' <remarks>TR_CALENDAR and TR_CALENDAR_PAYMENTS tables are written to.</remarks>
+    Protected Sub btnSaveApportionment_Click(sender As Object, e As System.EventArgs) Handles btnSaveAll.Click
+        Using conn As New OleDbConnection(Me.ConnectString)
+            ' Prepare tables and adapters.
+            conn.Open()
+            Dim adtCalendar As New OleDbDataAdapter("select * from genii_user.TR_CALENDAR", conn)
+            Dim dtCalendar As New DataTable("TR_CALENDAR")
+            adtCalendar.FillSchema(dtCalendar, SchemaType.Source)
+            adtCalendar.InsertCommand = New OleDbCommandBuilder(adtCalendar).GetInsertCommand()
+
+            Dim adtPayments As New OleDbDataAdapter("select * from genii_user.TR_CALENDAR_PAYMENTS", conn)
+            Dim dtPayments As New DataTable("TR_CALENDAR_PAYMENTS")
+            adtPayments.FillSchema(dtPayments, SchemaType.Source)
+            adtPayments.InsertCommand = New OleDbCommandBuilder(adtPayments).GetInsertCommand()
+
+
+            Dim trans As OleDbTransaction = conn.BeginTransaction(IsolationLevel.Serializable)
+            adtCalendar.InsertCommand.Transaction = trans
+            adtPayments.InsertCommand.Transaction = trans
+
+            ' Get new record id.
+            Dim newRecordID As Integer = GetNewID("RECORD_ID", "genii_user.TR_CALENDAR", conn, trans)
+
+            ' Save payments
+            For Each rowScanned As DataRow In Me.CashierTransactionsTable().Rows
+                Dim newCalendar As DataRow = dtCalendar.NewRow()
+                newCalendar("RECORD_ID") = newRecordID
+                newCalendar("TaxYear") = rowScanned("TAX_YEAR")
+                newCalendar("TaxRollNumber") = rowScanned("TAX_ROLL_NUMBER")
+                newCalendar("TASK_ID") = 101    ' Owner payment
+                newCalendar("TASK_DATE") = rowScanned("PAYMENT_DATE")
+                newCalendar("ADMIN_REVIEW") = 0
+                newCalendar("EDIT_USER") = Me.CurrentUserName
+                newCalendar("EDIT_DATE") = Date.Now
+                newCalendar("CREATE_USER") = newCalendar("EDIT_USER")
+                newCalendar("CREATE_DATE") = Date.Now
+                dtCalendar.Rows.Add(newCalendar)
+
+                Dim newPayment As DataRow = dtPayments.NewRow()
+                newPayment("RECORD_ID") = newRecordID
+                ' Following two lines should be removed once TaxYear and TaxRollNumber are removed from TR_CALENDAR_PAYMENTS.
+                newPayment("TaxYear") = rowScanned("TAX_YEAR")
+                newPayment("TaxRollNumber") = rowScanned("TAX_ROLL_NUMBER")
+
+                newPayment("PaymentEffectiveDate") = CDate(rowScanned("PAYMENT_DATE")).Date
+                newPayment("PaymentTypeCode") = 4   ' Scanned Payment
+                newPayment("PaymentMadeByCode") = 1 ' Owner Paid
+                newPayment("Pertinent1") = rowScanned("PAYOR_NAME")
+                newPayment("Pertinent2") = If(rowScanned.IsNull("CHECK_NUMBER"), DBNull.Value, "Check # " & rowScanned("CHECK_NUMBER"))
+                newPayment("PaymentAmount") = rowScanned("PAYMENT_AMT")
+                newPayment("CalcPayDate") = rowScanned("PAYMENT_DATE")
+                dtPayments.Rows.Add(newPayment)
+
+                newRecordID += 1
+            Next
+            Try
+                ' Save calendar tables.
+                adtCalendar.Update(dtCalendar)
+                adtPayments.Update(dtPayments)
+            Catch ex As Exception
+                trans.Rollback()
+                conn.Close()
+                Throw ex
+            End Try
+
+            trans.Commit()
+            conn.Close()
+        End Using
+
+        ' Clear session
+        Me.SessionDataset = Nothing
+    End Sub
+
+    Protected Sub btnLogin_Click(sender As Object, e As System.EventArgs) Handles btnLogin.Click
+        CreateNewSession()
+    End Sub
+
+    Protected Sub Page_PreRender(sender As Object, e As System.EventArgs) Handles Me.PreRender
+        LoadLogoutInfo()
+    End Sub
+
+    Protected Sub btnLogout_Click(sender As Object, e As System.EventArgs) Handles btnLogout.Click
+        DoLogout()
+    End Sub
+
+#Region "Letter Queuer in Payments Tab"
+    Private Sub ShowLetterQueuer(balance As Decimal)
+        Dim showQueuePanel As Boolean = False
+        Dim conn As New OleDbConnection(Me.ConnectString)
+        conn.Open()
+
+        Try
+            ' Letter 1 - Payment Accepted - Outstanding CP
+            ' Check previous years on parcel for CPs.
+            Dim cmd As New OleDbCommand()
+            cmd.Connection = conn
+            cmd.CommandText = "select count(*) from vTaxCPsIssued where APN=? and CP_STATUS in (1,2,3,4,7)"
+            cmd.Parameters.AddWithValue("@APN", Me.TaxRollMaster.APN)
+
+            If CInt(cmd.ExecuteScalar()) > 0 Then
+                ' Parcel has CPs.
+                showQueuePanel = True
+                Me.chkQueueLetter1.Visible = True
+                Me.chkQueueLetter1.Checked = True
+            Else
+                Me.chkQueueLetter1.Visible = False
+            End If
+        Finally
+            If conn IsNot Nothing AndAlso conn.State = ConnectionState.Open Then
+                conn.Close()
+            End If
+        End Try
+
+        ' Balance is remaining.
+        Me.chkQueueLetter2.Visible = False
+        Me.chkQueueLetter3.Visible = False
+        If balance > 0 Then
+            Dim latePayment As Boolean = False
+            ' Payment is late if delinquent fee is due.
+            For Each row As DataRow In Me.TaxRollMaster.TaxCalculationTable.Rows
+                If Me.TaxRollMaster.IsDelinquentFee(row("TaxTypeID")) Then
+                    latePayment = True
+                End If
+            Next
+
+            If latePayment Then
+                ' Letter 3 - Payment Late - Outstanding Balance
+                ' Payment date is after due data. Balance is remaining.
+                showQueuePanel = True
+                Me.chkQueueLetter2.Visible = True
+                Me.chkQueueLetter2.Checked = True
+            Else
+                ' Letter 2 - Payment Early - Outstanding Balance
+                ' Payment date is before due date. Balance is remaining.
+                showQueuePanel = True
+                Me.chkQueueLetter3.Visible = True
+                Me.chkQueueLetter3.Checked = True
+            End If
+        End If
+
+        ' Letter 4 - CP Redeemed - Letter to Investor
+        'TODO: Not yet implemented.
+        Me.chkQueueLetter4.Visible = False
+
+        ' Show queue panel if one or more letters have to be queued.
+        Me.pnlLetterQueuer.Visible = showQueuePanel
+    End Sub
+
+    Protected Sub btnQueueLetters_Click(sender As Object, e As System.EventArgs) Handles btnQueueLetters.Click
+        Dim paymentAmount As Decimal = GetDecimalOrZero(Me.txtAmountPaid.Text)
+        Dim taxAmount As Decimal = GetDecimalOrZero(Me.txtAmountDueNow.Text)
+        Dim balanceDue As Decimal = taxAmount - paymentAmount
+        Dim firstHalfDue As Date, secondHalfDue As Date, payBothHalves As Boolean
+
+        Me.TaxRollMaster.GetDelinquentDates(firstHalfDue, secondHalfDue)
+        payBothHalves = Me.chkPayBothHalves.Checked
+
+        If Me.chkQueueLetter1.Visible And Me.chkQueueLetter1.Checked Then
+            ' Letter 1 - Payment Accepted - Outstanding CP
+            Using conn As New OleDbConnection(Me.ConnectString)
+                ' Get CP purchase price.
+                conn.Open()
+                Dim cmd As New OleDbCommand()
+                cmd.Connection = conn
+                cmd.CommandText = "select sum(PurchaseValue) from vTaxCPsIssued where APN=?"
+                cmd.Parameters.AddWithValue("@APN", Me.TaxRollMaster.APN)
+
+                Dim objCPValue As Object = cmd.ExecuteScalar()
+                If IsNumeric(objCPValue) Then
+                    Dim purchaseValue As Decimal = CDec(objCPValue)
+                    QueueLetter(Me.TaxRollMaster.TaxYear, Me.TaxRollMaster.TaxRollNumber, 1, _
+                                paymentAmount, purchaseValue, purchaseValue, 0, secondHalfDue, secondHalfDue)
+                End If
+            End Using
+        End If
+
+        If Me.chkQueueLetter2.Visible And Me.chkQueueLetter2.Checked Then
+            ' Letter 2 - Payment Early - Outstanding Balance
+            QueueLetter(Me.TaxRollMaster.TaxYear, Me.TaxRollMaster.TaxRollNumber, 2, _
+                        paymentAmount, balanceDue, balanceDue, 0, secondHalfDue, secondHalfDue)
+        End If
+
+        If Me.chkQueueLetter3.Visible And Me.chkQueueLetter3.Checked Then
+            ' Letter 3 - Payment Late - Outstanding Balance
+            QueueLetter(Me.TaxRollMaster.TaxYear, Me.TaxRollMaster.TaxRollNumber, 3, _
+                        paymentAmount, balanceDue, balanceDue, 0, secondHalfDue, secondHalfDue)
+        End If
+
+        If Me.chkQueueLetter4.Visible And Me.chkQueueLetter4.Checked Then
+            ' Letter 4 - CP Redeemed - Letter to Investor
+            'TODO: Not yet implemented.
+        End If
+
+        Me.pnlLetterQueuer.Visible = False
+        Me.BindLettersGrid()
+    End Sub
+
+    Private Sub QueueLetter(taxYear As Integer, taxRollNumber As Integer, letterType As Integer, _
+                            amount1 As Decimal, amount2 As Decimal, amount3 As Decimal, amount4 As Decimal, _
+                            date1 As DateTime, date2 As DateTime)
+        Dim conn As New OleDbConnection(Me.ConnectString)
+        conn.Open()
+        Dim trans As OleDbTransaction = conn.BeginTransaction()
+        Try
+            ' Get new record id.
+            Dim newRecordID As Integer
+            Using cmdRecordID As New OleDbCommand("select max(RECORD_ID) from genii_user.CASHIER_LETTERS", conn)
+                Dim objRecordID As Object
+                cmdRecordID.Transaction = trans
+                objRecordID = cmdRecordID.ExecuteScalar()
+                If (Not IsDBNull(objRecordID)) AndAlso IsNumeric(objRecordID) Then
+                    newRecordID = CInt(objRecordID) + 1
+                Else
+                    newRecordID = 1
+                End If
+            End Using
+
+            ' Insert new record.
+            Using cmd As New OleDbCommand()
+                cmd.CommandText = "insert into genii_user.CASHIER_LETTERS (" & _
+                    "RECORD_ID, CASHIER, TAX_YEAR, TAX_ROLL_NUMBER, LETTER_TYPE, LETTER_DATE, " & _
+                    "AMOUNT_1, AMOUNT_2, AMOUNT_3, AMOUNT_4, DATE_1, DATE_2, " & _
+                    "CREATE_USER, CREATE_DATE, EDIT_USER, EDIT_DATE" & _
+                    ") values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                cmd.Connection = conn
+                cmd.Transaction = trans
+
+                cmd.Parameters.AddWithValue("@RECORD_ID", newRecordID)
+                cmd.Parameters.AddWithValue("@CASHIER", Me.CurrentUserName)
+                cmd.Parameters.AddWithValue("@TAX_YEAR", taxYear)
+                cmd.Parameters.AddWithValue("@TAX_ROLL_NUMBER", taxRollNumber)
+                cmd.Parameters.AddWithValue("@LETTER_TYPE", letterType)
+                cmd.Parameters.AddWithValue("@LETTER_DATE", DateTime.Now)
+                cmd.Parameters.AddWithValue("@AMOUNT_1", amount1)
+                cmd.Parameters.AddWithValue("@AMOUNT_2", amount2)
+                cmd.Parameters.AddWithValue("@AMOUNT_3", amount3)
+                cmd.Parameters.AddWithValue("@AMOUNT_4", amount4)
+                cmd.Parameters.AddWithValue("@DATE_1", date1)
+                cmd.Parameters.AddWithValue("@DATE_2", date2)
+                cmd.Parameters.AddWithValue("@CREATE_USER", Me.CurrentUserName)
+                cmd.Parameters.AddWithValue("@CREATE_DATE", DateTime.Now)
+                cmd.Parameters.AddWithValue("@EDIT_USER", Me.CurrentUserName)
+                cmd.Parameters.AddWithValue("@EDIT_DATE", DateTime.Now)
+
+                cmd.ExecuteNonQuery()
+            End Using
+            trans.Commit()
+        Catch ex As Exception
+            trans.Rollback()
+        Finally
+            If conn IsNot Nothing AndAlso conn.State = ConnectionState.Open Then
+                conn.Close()
+            End If
+        End Try
+
+    End Sub
+#End Region
+
+#Region "Letters Tab"
+    Private Sub BindLettersGrid()
+        Dim sql As String = "select RECORD_ID, [DESCRIPTION], LETTERS_COUNT from vCashierLetters order by RECORD_ID"
+        Using adp As New OleDbDataAdapter(sql, Me.ConnectString)
+            Dim dt As New DataTable()
+            adp.Fill(dt)
+
+            Me.grdLetters.DataSource = dt
+            Me.grdLetters.DataBind()
+        End Using
+    End Sub
+
+    Private Sub GenerateLetters()
+        Dim reports As New Generic.Dictionary(Of Integer, Byte())()
+
+        ' Generate reports.
+        For Each row As GridViewRow In Me.grdLetters.Rows
+            If row.RowType = DataControlRowType.DataRow Then
+                Dim chkLettersSelect As CheckBox = DirectCast(row.FindControl("chkLettersSelect"), CheckBox)
+                Dim hdnLetterType As HiddenField = DirectCast(row.FindControl("hdnLetterType"), HiddenField)
+
+                If chkLettersSelect.Checked Then
+                    reports.Add(CInt(hdnLetterType.Value), GenerateLetter(CInt(hdnLetterType.Value)))
+                End If
+            End If
+        Next
+
+        ' Output to response.
+        With Me.Response
+            .ClearContent()
+            .ClearHeaders()
+            .AddHeader("content-disposition", "attachment")
+            .AddHeader("filename", "Reports.zip")
+            .ContentType = "application/zip"
+            ExportReports(reports, .OutputStream)
+            .End()
+        End With
+    End Sub
+
+    Private Sub ExportReports(reports As Generic.Dictionary(Of Integer, Byte()), output As Stream)
+        ' Get letter type descriptions.
+        Dim dt As New DataTable()
+        Using adp As New OleDbDataAdapter("select RECORD_ID, [DESCRIPTION] from genii_user.CASHIER_LETTER_TYPES", Me.ConnectString)
+            adp.Fill(dt)
+        End Using
+
+        ' Add reports to zip file.
+        Dim crc As New ICSharpCode.SharpZipLib.Checksums.Crc32
+        Dim zip As New ZipOutputStream(output)
+        zip.SetLevel(3)
+        For Each report As Generic.KeyValuePair(Of Integer, Byte()) In reports
+            Dim description As String = dt.Select("RECORD_ID=" & report.Key)(0).Item("DESCRIPTION")
+            Dim entry As New ZipEntry(description & ".pdf")
+            entry.DateTime = DateTime.Now
+            entry.Size = report.Value.Length
+            crc.Reset()
+            crc.Update(report.Value)
+            entry.Crc = crc.Value
+            zip.PutNextEntry(entry)
+            zip.Write(report.Value, 0, report.Value.Length)
+            zip.CloseEntry()
+
+            UpdateLetterPrinted(report.Key)
+        Next
+
+        zip.Close()
+    End Sub
+
+    Private Function GenerateLetter(letterType As Integer) As Byte()
+        ' Load report.
+        Dim rpt As New ReportDocument()
+        Dim folder As String = Path.Combine(Path.GetDirectoryName(Request.PhysicalPath), "Treasury")
+
+        Select Case letterType
+            Case 1
+                ' Payment Accepted - Outstanding CP
+                rpt.Load(Path.Combine(folder, "ltrPaymentAcceptedOutstandingCP.rpt"))
+            Case 2
+                ' Early Payment - Outstanding Balance
+                rpt.Load(Path.Combine(folder, "ltrEarlyPaymentOutstandingBalance.rpt"))
+            Case 3
+                ' Late Payment - Outstanding Balance
+                rpt.Load(Path.Combine(folder, "ltrLatePaymentOutstandingBalance.rpt"))
+            Case 4
+                ' CP Redeemed - Letter to Investor
+                rpt.Load(Path.Combine(folder, "ltrCPRedeemedInvestorLetter.rpt"))
+        End Select
+
+        ' Database authentication.
+        Dim userName As String = TaxPayments.GetDatabaseUserName(Me.ConnectString)
+        Dim password As String = TaxPayments.GetDatabasePassword(Me.ConnectString)
+        rpt.SetDatabaseLogon(userName, password)
+
+        ' Generate report.
+        Dim str As Stream = rpt.ExportToStream(CrystalDecisions.Shared.ExportFormatType.PortableDocFormat)
+        rpt.Close()
+        Dim bytes(str.Length - 1) As Byte
+        str.Read(bytes, 0, bytes.Length)
+
+        Return bytes
+    End Function
+
+    Private Sub UpdateLetterPrinted(letterType As Integer)
+        Using conn As New OleDbConnection(Me.ConnectString)
+            conn.Open()
+
+            ' Prepare where clause.
+            Dim whereClause As String = String.Empty
+            Select Case letterType
+                Case 1
+                    whereClause = "LETTER_TYPE=1 and (PRINTED is null or PRINTED<>1)"
+                Case 2
+                    whereClause = "LETTER_TYPE=2 and (PRINTED is null or PRINTED<>1)"
+                Case 3
+                    whereClause = "LETTER_TYPE=3 and (PRINTED is null or PRINTED<>1)"
+                Case 4
+                    whereClause = "LETTER_TYPE=4 and APPROVED=1 and (PRINTED is null or PRINTED<>1)"
+            End Select
+
+            ' Create command.
+            Dim cmd As New OleDbCommand("update genii_user.CASHIER_LETTERS set PRINTED=1,EDIT_USER=?,EDIT_DATE=? where " & whereClause, conn)
+            cmd.Parameters.AddWithValue("@EDIT_USER", Me.CurrentUserName)
+            cmd.Parameters.AddWithValue("@EDIT_DATE", DateTime.Now)
+            cmd.ExecuteNonQuery()
+
+            conn.Close()
+        End Using
+    End Sub
+
+    Protected Sub btnLettersPrint_Click(sender As Object, e As System.EventArgs) Handles btnLettersPrint.Click
+        GenerateLetters()
+    End Sub
+
+    Protected Sub grdLetters_RowCommand(sender As Object, e As System.Web.UI.WebControls.GridViewCommandEventArgs) Handles grdLetters.RowCommand
+        Select Case e.CommandName
+            Case "LetterDetail"
+                Dim letterType As Integer = CInt(e.CommandArgument)
+                Dim letterTypeDesc As String
+                Dim sql As String = "select LTR.CASHIER, LTR.TAX_YEAR, LTR.TAX_ROLL_NUMBER, LTR.LETTER_DATE, LTR.APPROVED, isnull(TRM.FIRST_NAME, '') + ' ' + isnull(TRM.MIDDLE_NAME, '') + ' ' + isnull(TRM.LAST_NAME, '') as OWNER_NAME from genii_user.CASHIER_LETTERS as LTR inner join genii_user.TR as TRM on LTR.TAX_YEAR = TRM.TaxYear and LTR.TAX_ROLL_NUMBER = TRM.TaxRollNumber where LTR.LETTER_TYPE=?"
+                Using conn As New OleDbConnection(Me.ConnectString)
+                    conn.Open()
+
+                    ' Bind letter details grid.
+                    Dim cmdLetters As New OleDbCommand(sql, conn)
+                    cmdLetters.Parameters.AddWithValue("@LETTER_TYPE", letterType)
+                    Me.grdLettersDetail.DataSource = cmdLetters.ExecuteReader()
+                    Me.grdLettersDetail.DataBind()
+
+                    ' Get letter type description.
+                    Dim cmdLetterType As New OleDbCommand("select [DESCRIPTION] from genii_user.CASHIER_LETTER_TYPES where RECORD_ID=?", conn)
+                    cmdLetterType.Parameters.AddWithValue("@RECORD_ID", letterType)
+                    letterTypeDesc = cmdLetterType.ExecuteScalar().ToString()
+                End Using
+
+                ClientScript.RegisterStartupScript(Me.GetType(), "LetterDetailsDialog", _
+                                                   String.Format("openLetterDetailsDialog('{0}');", letterTypeDesc), _
+                                                   True)
+        End Select
+    End Sub
+
+#End Region
+
+    Private Class TaxRollMasterClass
+        Inherits RowClass
+
+        Public Sub New(connectString As String)
+            MyBase.New(connectString)
+        End Sub
+
+        Public Overrides ReadOnly Property TableName As String
+            Get
+                Return "genii_user.TR"
+            End Get
+        End Property
+
+        Public Overrides ReadOnly Property ColumnNames As String
+            Get
+                Return "*"
+            End Get
+        End Property
+
+        Public Overrides ReadOnly Property SortOrder As String
+            Get
+                Return "TaxYear ASC"
+            End Get
+        End Property
+
+        Public Function IsLoaded() As Boolean
+            If _dataRow Is Nothing Then
+                Return False
+            End If
+            If IsDBNull(_dataRow("TaxRollNumber")) Then
+                Return False
+            End If
+
+            Return True
+        End Function
+
+        Public Overloads Sub LoadData()
+            Dim wc As String
+            If String.IsNullOrEmpty(Me.APN) Then
+                wc = String.Format("TaxRollNumber={0} and TaxYear={1}", Me.TaxRollNumber, Me.TaxYear)
+            Else
+                wc = String.Format("APN='{0}' and TaxYear={1}", Me.APN, Me.TaxYear)
+            End If
+            MyBase.LoadData(wc)
+        End Sub
+
+        Private _taxRollValuesRow As DataRow
+        Public ReadOnly Property TaxRollValuesRow() As DataRow
+            Get
+                If _taxRollValuesRow Is Nothing Then
+                    Using cmd As New OleDbCommand()
+                        cmd.Connection = Me.Connection
+                        cmd.CommandText = "select * from genii_user.TR_VALUES where TaxYear=? and TaxRollNumber=?"
+                        cmd.Parameters.AddWithValue("@TaxYear", Me.TaxYear)
+                        cmd.Parameters.AddWithValue("@TaxRollNumber", Me.TaxRollNumber)
+                        Dim adt As New OleDbDataAdapter(cmd)
+                        Dim dt As New DataTable()
+                        adt.Fill(dt)
+                        If dt.Rows.Count >= 1 Then
+                            _taxRollValuesRow = dt.Rows(0)
+                        End If
+                    End Using
+                End If
+                Return _taxRollValuesRow
+            End Get
+        End Property
+
+        Private Function GetParameter(name As String, type As OleDbType, value As Object) As OleDbParameter
+            Dim param As New OleDbParameter(name, type)
+            param.Value = value
+            Return param
+        End Function
+
+        Private _taxCalculationTable As DataTable
+        Public ReadOnly Property TaxCalculationTable As DataTable
+            Get
+                If _taxCalculationTable Is Nothing Then
+                    Dim cmd As New OleDbCommand()
+                    cmd.Connection = Me.Connection
+                    cmd.CommandText = "select * from genii_user.tblTaxesCharges where TaxYear=? and TaxRollNumber=?"
+                    cmd.Parameters.Add(GetParameter("@TaxYear", OleDbType.VarChar, Me.TaxYear))
+                    cmd.Parameters.Add(GetParameter("@TaxRollNumber", OleDbType.VarChar, Me.TaxRollNumber))
+                    Dim adt As New OleDbDataAdapter(cmd)
+                    _taxCalculationTable = New DataTable()
+                    adt.Fill(_taxCalculationTable)
+                End If
+
+                Return _taxCalculationTable
+            End Get
+        End Property
+
+        Private _taxNamesTable As DataTable
+        Public ReadOnly Property TaxNamesTable() As DataTable
+            Get
+                If _taxNamesTable Is Nothing Then
+                    Dim cmd As New OleDbCommand()
+                    cmd.Connection = Me.Connection
+                    cmd.CommandText = "select * from genii_user.tblTaxNames where TaxYear=? and TaxRollNumber=?"
+                    cmd.Parameters.AddWithValue("@TaxYear", Me.TaxYear)
+                    cmd.Parameters.AddWithValue("@TaxRollNumber", Me.TaxRollNumber)
+                    Dim adt As New OleDbDataAdapter(cmd)
+                    _taxNamesTable = New DataTable()
+                    adt.Fill(_taxNamesTable)
+                End If
+
+                Return _taxNamesTable
+            End Get
+        End Property
+
+        Public Sub RecalculateFees(paymentDate As Date)
+            Using cmd As New OleDbCommand()
+                cmd.Connection = Me.Connection
+                cmd.CommandText = "SetDelinquentFees"
+                cmd.CommandType = CommandType.StoredProcedure
+                cmd.Parameters.Add("RETURN_VALUE", OleDbType.Integer).Direction = ParameterDirection.ReturnValue
+                cmd.Parameters.AddWithValue("@taxYear", Me.TaxYear)
+                cmd.Parameters.AddWithValue("@taxRollNumber", Me.TaxRollNumber)
+                cmd.Parameters.AddWithValue("@paymentDate", paymentDate)
+                cmd.Parameters.AddWithValue("@userName", TaxPayments.CurrentUserName)
+
+                cmd.ExecuteNonQuery()
+            End Using
+        End Sub
+
+        Public Function GetTaxes() As Decimal
+            Dim tax As Object = Me.TaxCalculationTable.Compute("SUM(ChargeAmount)", _
+                                    "ChargeAmount is not null and TaxTypeID <=" & Me.MaxTaxTypeID)
+            If IsNumeric(tax) Then
+                Return CDec(tax)
+            Else
+                Return 0
+            End If
+        End Function
+
+        Public Function GetChargesTable() As DataView
+            Dim vw As New DataView(Me.TaxCalculationTable)
+            vw.RowFilter = "TaxTypeID > " & Me.MaxTaxTypeID
+            Return vw
+        End Function
+
+        Public Sub GetDelinquentDates(ByRef firstHalfDelinquent As Date, ByRef secondHalfDelinquent As Date)
+            If Me.TaxRollValuesRow.IsNull("FirstHalfDelinquent") Then
+                firstHalfDelinquent = Nothing
+            Else
+                firstHalfDelinquent = Me.TaxRollValuesRow("FirstHalfDelinquent")
+            End If
+
+            If Me.TaxRollValuesRow.IsNull("SecondHalfDelinquent") Then
+                secondHalfDelinquent = Nothing
+            Else
+                secondHalfDelinquent = Me.TaxRollValuesRow("SecondHalfDelinquent")
+            End If
+        End Sub
+
+        Public Sub GetInterestAndFee(paymentDate As Date, ByRef interest As Decimal, ByRef fee As Decimal)
+            interest = 0
+            fee = 0
+
+            For Each row As DataRow In Me.TaxCalculationTable.Rows
+                Dim taxTypeID As Integer = CInt(row("TaxTypeID"))
+                Dim chargeAmount As Decimal = If(row.IsNull("ChargeAmount"), 0, CDec(row("ChargeAmount")))
+                If IsInterestFee(taxTypeID) Then
+                    interest += chargeAmount
+                ElseIf IsDelinquentFee(taxTypeID) Then
+                    fee += chargeAmount
+                End If
+            Next
+        End Sub
+
+        Public Function GetTotalPayments() As Decimal
+            Dim cmd As New OleDbCommand()
+            cmd.Connection = Me.Connection
+            cmd.CommandText = "select sum([TCP].PaymentAmount) from genii_user.TR_CALENDAR TC inner join genii_user.TR_CALENDAR_PAYMENTS [TCP] on TC.RECORD_ID = [TCP].RECORD_ID where TC.TaxYear=? and TC.TaxRollNumber=?"
+            cmd.Parameters.AddWithValue("@TaxYear", Me.TaxYear)
+            cmd.Parameters.AddWithValue("@TaxRollNumber", Me.TaxRollNumber)
+
+            Dim payments As Object = cmd.ExecuteScalar()
+            If payments IsNot Nothing AndAlso IsNumeric(payments) Then
+                Return CDec(payments)
+            Else
+                Return 0
+            End If
+        End Function
+
+        Private _tblTaxAuthChargeTypes As DataTable
+        Public Function IsInterestFee(taxTypeID As Integer) As Boolean
+            If _tblTaxAuthChargeTypes Is Nothing Then
+                _tblTaxAuthChargeTypes = New DataTable()
+                Using adt As New OleDbDataAdapter("select * from genii_user.ST_TAX_TYPES", Me.Connection)
+                    adt.Fill(_tblTaxAuthChargeTypes)
+                End Using
+            End If
+
+            Dim rows As DataRow() = _tblTaxAuthChargeTypes.Select("TaxTypeID=" & taxTypeID)
+            If rows.Length >= 1 Then
+                Return rows(0)("DelinquentInterest") = 1
+            Else
+                Throw New ApplicationException("No matching AuthType:" & taxTypeID)
+            End If
+        End Function
+
+        Public Function IsDelinquentFee(taxTypeID As Integer) As Boolean
+            If _tblTaxAuthChargeTypes Is Nothing Then
+                _tblTaxAuthChargeTypes = New DataTable()
+                Using adt As New OleDbDataAdapter("select * from genii_user.tblTaxAuthChargeTypes", Me.Connection)
+                    adt.Fill(_tblTaxAuthChargeTypes)
+                End Using
+            End If
+
+            Dim rows As DataRow() = _tblTaxAuthChargeTypes.Select("TaxTypeID=" & taxTypeID)
+            If rows.Length >= 1 Then
+                Return rows(0)("DelinquentFee") = 1
+            Else
+                Throw New ApplicationException("No matching AuthType:" & taxTypeID)
+            End If
+        End Function
+
+#Region "Properties"
+        Public Property TaxYear As Integer
+            Get
+                Return MyBase.GetInt("TaxYear")
+            End Get
+            Set(value As Integer)
+                MyBase.SetInt("TaxYear", value)
+            End Set
+        End Property
+
+        Public Property TaxRollNumber As Integer
+            Get
+                Return MyBase.GetInt("TaxRollNumber")
+            End Get
+            Set(value As Integer)
+                MyBase.SetInt("TaxRollNumber", value)
+            End Set
+        End Property
+
+        Public Property Secured As Boolean
+            Get
+                Return MyBase.GetBoolean("SecuredUnsecured")
+            End Get
+            Set(value As Boolean)
+                MyBase.SetBoolean("SecuredUnsecured", value)
+            End Set
+        End Property
+
+        Public Property APN As String
+            Get
+                Return MyBase.GetString("APN")
+            End Get
+            Set(value As String)
+                MyBase.SetString("APN", value)
+            End Set
+        End Property
+
+        Public Property Latitude As Single
+            Get
+                Return MyBase.GetSingle("LATITUDE")
+            End Get
+            Set(value As Single)
+                MyBase.SetSingle("LATITUDE", value)
+            End Set
+        End Property
+
+        Public Property Longitude As Single
+            Get
+                Return MyBase.GetSingle("LONGITUDE")
+            End Get
+            Set(value As Single)
+                MyBase.SetSingle("LONGITUDE", value)
+            End Set
+        End Property
+
+        Public Property BankruptcyAlert As Boolean
+            Get
+                Return MyBase.GetBoolean("BANKRUPTCY_ALERT")
+            End Get
+            Set(value As Boolean)
+                MyBase.SetBoolean("BANKRUPTCY_ALERT", value)
+            End Set
+        End Property
+
+        Public Property AlertStatus As Short
+            Get
+                Return MyBase.GetShort("ALERT_STATUS")
+            End Get
+            Set(value As Short)
+                MyBase.SetShort("ALERT_STATUS", value)
+            End Set
+        End Property
+
+        Public Property TaxIDNumber As Integer
+            Get
+                Return MyBase.GetInt("TaxIDNumber")
+            End Get
+            Set(value As Integer)
+                MyBase.SetInt("TaxIDNumber", value)
+            End Set
+        End Property
+
+        Public Property TaxPayerID As Integer
+            Get
+                Return MyBase.GetInt("TaxPayerID")
+            End Get
+            Set(value As Integer)
+                MyBase.SetInt("TaxPayerID", value)
+            End Set
+        End Property
+
+        Public Property CurrentBalance As Decimal
+            Get
+                Return MyBase.GetDecimal("CurrentBalance")
+            End Get
+            Set(value As Decimal)
+                MyBase.SetDecimal("CurrentBalance", value)
+            End Set
+        End Property
+
+        Public Property EditUser As String
+            Get
+                Return MyBase.GetString("EDIT_USER")
+            End Get
+            Set(value As String)
+                MyBase.SetString("EDIT_USER", value)
+            End Set
+        End Property
+
+        Public Property EditDate As Date
+            Get
+                Return MyBase.GetDate("EDIT_DATE")
+            End Get
+            Set(value As Date)
+                MyBase.SetDate("EDIT_DATE", value)
+            End Set
+        End Property
+
+        Public Property CreateUser As String
+            Get
+                Return MyBase.GetString("CREATE_USER")
+            End Get
+            Set(value As String)
+                MyBase.SetString("CREATE_USER", value)
+            End Set
+        End Property
+
+        Public Property CreateDate As Date
+            Get
+                Return MyBase.GetDate("CREATE_DATE")
+            End Get
+            Set(value As Date)
+                MyBase.SetDate("CREATE_DATE", value)
+            End Set
+        End Property
+
+        Public ReadOnly Property FirstName As String
+            Get
+                If Me.TaxNamesTable.Rows.Count > 0 Then
+                    Return Me.TaxNamesTable.Rows(0)("FirstName").ToString()
+                Else
+                    Return _dataRow("FIRST_NAME").ToString()
+                End If
+            End Get
+        End Property
+
+        Public ReadOnly Property MiddleName As String
+            Get
+                If Me.TaxNamesTable.Rows.Count > 0 Then
+                    Return Me.TaxNamesTable.Rows(0)("MiddleName").ToString()
+                Else
+                    Return _dataRow("MIDDLE_NAME").ToString()
+                End If
+            End Get
+        End Property
+
+        Public ReadOnly Property LastName As String
+            Get
+                If Me.TaxNamesTable.Rows.Count > 0 Then
+                    Return Me.TaxNamesTable.Rows(0)("LastName").ToString()
+                Else
+                    Return _dataRow("LAST_NAME").ToString()
+                End If
+            End Get
+        End Property
+
+        Public ReadOnly Property OwnerName As String
+            Get
+                OwnerName = LastName
+                If (Not String.IsNullOrEmpty(OwnerName)) AndAlso (Not String.IsNullOrEmpty(MiddleName)) Then
+                    OwnerName = MiddleName & " " & OwnerName
+                End If
+                If (Not String.IsNullOrEmpty(OwnerName)) AndAlso (Not String.IsNullOrEmpty(FirstName)) Then
+                    OwnerName = FirstName & " " & OwnerName
+                End If
+            End Get
+        End Property
+
+        Private _maxTaxTypeID As Integer?
+        Public ReadOnly Property MaxTaxTypeID As Integer
+            Get
+                If _maxTaxTypeID Is Nothing Then
+                    Using cmd As New OleDbCommand()
+                        cmd.Connection = Me.Connection
+                        cmd.CommandText = "select FieldData from genii_user.tblTaxSystemParameters where FieldName='MaxTaxTypeID'"
+                        Dim objResult As Object = cmd.ExecuteScalar()
+                        If IsNumeric(objResult) Then
+                            _maxTaxTypeID = CInt(objResult)
+                        Else
+                            ' Default
+                            _maxTaxTypeID = 40
+                        End If
+                    End Using
+                End If
+
+                Return _maxTaxTypeID
+            End Get
+        End Property
+
+        Private _maxTaxDueBothHalves As Decimal?
+        Public ReadOnly Property MaxTaxDueBothHalves As Decimal
+            Get
+                If _maxTaxDueBothHalves Is Nothing Then
+                    Using cmd As New OleDbCommand()
+                        cmd.Connection = Me.Connection
+                        cmd.CommandText = "select FieldData from genii_user.tblTaxSystemParameters where FieldName='MaxTaxDueBothHalves'"
+                        Dim objResult As Object = cmd.ExecuteScalar()
+                        If IsNumeric(objResult) Then
+                            _maxTaxDueBothHalves = CDec(objResult)
+                        Else
+                            ' Default
+                            _maxTaxDueBothHalves = 100
+                        End If
+                    End Using
+                End If
+
+                Return _maxTaxDueBothHalves
+            End Get
+        End Property
+#End Region
+    End Class
+
+    <Serializable()> _
+    Private MustInherit Class RowClass
+        Private _dataTable As DataTable
+        Protected _dataRow As DataRow
+        Protected _connectString As String
+
+        Protected Sub New(connectString As String)
+            _connectString = connectString
+            _dataTable = New DataTable()
+            _dataRow = _dataTable.NewRow()
+        End Sub
+
+        Public MustOverride ReadOnly Property TableName As String
+        Public MustOverride ReadOnly Property ColumnNames As String
+        Public MustOverride ReadOnly Property SortOrder As String
+
+        Protected Function LoadData(whereClause As String) As Integer
+            Dim cmd As New OleDbCommand()
+            cmd.Connection = Me.Connection
+            cmd.CommandText = String.Format("select {0} from {1} where {2} order by {3}", _
+                                        Me.ColumnNames, Me.TableName, whereClause, Me.SortOrder)
+            Dim adt As New OleDbDataAdapter(cmd)
+
+            _dataTable = New DataTable()
+            adt.Fill(_dataTable)
+            If _dataTable.Rows.Count >= 1 Then
+                _dataRow = _dataTable.Rows(0)
+                Return 1
+            Else
+                _dataRow = _dataTable.NewRow()
+                Return 0
+            End If
+        End Function
+
+        <NonSerialized()> _
+        Private _connection As OleDbConnection
+        Protected ReadOnly Property Connection As OleDbConnection
+            Get
+                If _connection Is Nothing Then
+                    _connection = New OleDbConnection(_connectString)
+                End If
+                If _connection.State <> ConnectionState.Open Then
+                    _connection.Open()
+                End If
+                Return _connection
+            End Get
+        End Property
+
+        Protected Overrides Sub Finalize()
+            'SyncLock _connection
+            '    If _connection IsNot Nothing AndAlso _connection.State = ConnectionState.Open Then
+            '        _connection.Close()
+            '    End If
+            'End SyncLock
+        End Sub
+
+#Region "Row Accessors"
+        Private Function GetValue(columnName As String, defaultValue As Object) As Object
+            If Not _dataTable.Columns.Contains(columnName) Then
+                Return defaultValue
+            End If
+
+            If _dataRow.IsNull(columnName) Then
+                Return defaultValue
+            Else
+                Return _dataRow.Item(columnName)
+            End If
+        End Function
+
+        Private Sub SetValue(Of T)(columnName As String, value As T)
+            ' Add column if required.
+            If Not _dataTable.Columns.Contains(columnName) Then
+                _dataTable.Columns.Add(columnName, GetType(T))
+            End If
+
+            ' Set value or null.
+            If value Is Nothing Then
+                _dataRow.Item(columnName) = DBNull.Value
+            Else
+                _dataRow.Item(columnName) = value
+            End If
+        End Sub
+
+        Protected Function GetInt(columnName As String) As Integer
+            Return GetValue(columnName, 0)
+        End Function
+
+        Protected Sub SetInt(columnName As String, value As Integer)
+            SetValue(Of Integer)(columnName, value)
+        End Sub
+
+        Protected Function GetString(columnName As String) As String
+            Return GetValue(columnName, String.Empty)
+        End Function
+
+        Protected Sub SetString(columnName As String, value As String)
+            If String.IsNullOrEmpty(value) Then
+                SetValue(Of String)(columnName, Nothing)
+            Else
+                SetValue(Of String)(columnName, value)
+            End If
+        End Sub
+
+        Protected Function GetDate(columnName As String) As Date
+            Return GetValue(columnName, Nothing)
+        End Function
+
+        Protected Sub SetDate(columnName As String, value As Date)
+            SetValue(Of Date)(columnName, value)
+        End Sub
+
+        Protected Function GetBoolean(columnName As String) As Boolean
+            Dim val As Object = GetValue(columnName, False)
+            If IsNumeric(val) Then
+                If val = 0 Then
+                    Return False
+                Else
+                    Return True
+                End If
+            Else
+                ' Should be boolean.
+                Return CBool(val)
+            End If
+        End Function
+
+        Protected Sub SetBoolean(columnName As String, value As Boolean)
+            SetValue(Of Boolean)(columnName, value)
+        End Sub
+
+        Protected Function GetDecimal(columnName As String) As Decimal
+            Return GetValue(columnName, 0)
+        End Function
+
+        Protected Sub SetDecimal(columnName As String, value As Decimal)
+            SetValue(Of Decimal)(columnName, value)
+        End Sub
+
+        Protected Function GetShort(columnName As String) As Short
+            Return GetValue(columnName, 0)
+        End Function
+
+        Protected Sub SetShort(columnName As String, value As Short)
+            SetValue(Of Short)(columnName, value)
+        End Sub
+
+        Protected Function GetSingle(columnName As String) As Single
+            Return GetValue(columnName, 0)
+        End Function
+
+        Protected Sub SetSingle(columnName As String, value As Single)
+            SetValue(Of Single)(columnName, value)
+        End Sub
+#End Region
+    End Class
+End Class

@@ -1,0 +1,217 @@
+﻿<%@ WebHandler Language="VB" Class="GetBlob" %>
+
+Imports System
+Imports System.Web
+Imports System.Data
+Imports System.Data.OleDb
+Imports Genesis
+
+Public Class GetBlob : Implements IHttpHandler
+    
+    Private _context As HttpContext
+   
+    Public Sub ProcessRequest(ByVal context As HttpContext) Implements IHttpHandler.ProcessRequest
+        _context = context
+        Render()
+    End Sub
+ 
+    Public ReadOnly Property IsReusable() As Boolean Implements IHttpHandler.IsReusable
+        Get
+            Return False
+        End Get
+    End Property
+
+    Private _connectString As String
+    
+    Private ReadOnly Property ConnectString As String
+        Get
+            Return ConfigurationManager.ConnectionStrings("ConnString").ConnectionString
+        End Get
+        
+        '' OLD CODE, replaced with above
+        'Get
+        '    If String.IsNullOrEmpty(_connectString) Then
+        '        Dim dbs As New Genesis.Metadata.ConnectDataset(Genesis.Common.DBUtils.MetaConnectString)
+        '        Dim treas As Genesis.Metadata.ConnectDef
+        '        If IsNumeric(_context.Request.QueryString("connectionid")) Then
+        '            treas = dbs.ConnectDefs.ItemById(CInt(_context.Request.QueryString("connectionid")))
+        '        Else
+        '            ' Default: return treasury connection string.
+        '            treas = dbs.ConnectDefs("NCIS Treasury")
+        '        End If
+        '        If treas IsNot Nothing Then
+        '            _connectString = treas.ConnectString
+        '        End If
+        '    End If
+        '    Return _connectString
+        'End Get
+    End Property
+    
+    Public ReadOnly Property tableName() As String
+        Get
+            Return _context.Request.QueryString("tabname")
+        End Get
+    End Property
+
+    Public ReadOnly Property columnName() As String
+        Get
+            Return _context.Request.QueryString("colname")
+        End Get
+    End Property
+    
+    Public ReadOnly Property primaryKeyNames() As String
+        Get
+            Return _context.Request.QueryString("pkNames")
+        End Get
+    End Property
+
+    Public ReadOnly Property primaryKeyValues() As String
+        Get
+            Return _context.Request.QueryString("pkValues")
+        End Get
+    End Property
+    
+    Public ReadOnly Property imageHeight() As String
+        Get
+            Return _context.Request.QueryString("height")
+        End Get
+    End Property
+
+    Public ReadOnly Property ImageWidth() As String
+        Get
+            Return _context.Request.QueryString("width")
+        End Get
+    End Property
+    
+    Private Function RowFilter(ByVal colNames As String, ByVal colValues As String) As String
+        Dim filter As New StringBuilder()
+
+        Dim colNameArray As String() = colNames.Split(","c)
+        Dim colValueArray As String() = colValues.Split(","c)
+
+        For count As Integer = 0 To colNameArray.Length - 1
+            filter.AppendFormat("({0} = {1}) AND ", colNameArray(count), colValueArray(count))
+        Next
+
+        If filter.Length > 0 Then
+            filter = filter.Remove(filter.Length - 4, 4)
+        End If
+
+        Return filter.ToString()
+    End Function
+    
+    Private Function GetRow() As DataRow
+        Dim sql As String = String.Format("SELECT {0} FROM {1} WHERE {2}", Me.columnName, Me.tableName, RowFilter(Me.primaryKeyNames, Me.primaryKeyValues))
+        
+        Dim dt As New DataTable()
+        
+        Using adt As New OleDbDataAdapter(sql, Me.ConnectString)
+            adt.Fill(dt)
+        End Using
+        
+        If dt.Rows.Count > 0 Then
+            Return dt.Rows(0)
+        Else
+            Return Nothing
+        End If
+    End Function
+    
+    Private Sub Render()
+        Dim row As DataRow = GetRow()
+        
+        If row Is Nothing OrElse row.IsNull(Me.columnName) Then
+            SendBlankImage()
+            Exit Sub
+        End If
+        
+        Dim rawData As Byte() = row(columnName)
+        Dim fileType As String = String.Empty
+        Dim fileName As String = String.Empty
+        Dim data As Byte() = Nothing
+        
+        Genesis.Common.BlobField.DecodeBlob(rawData, fileType, fileName, data)
+
+        If data IsNot Nothing AndAlso data.Length > 0 AndAlso (IsNumeric(Me.imageHeight) Or IsNumeric(Me.ImageWidth)) Then
+            ' Request for image resize. Check if data exists
+            If ((fileType IsNot Nothing) And (fileType.Length > 0)) Then
+                Dim thumbnail As System.Drawing.Bitmap = Nothing
+                Dim memStream As System.IO.MemoryStream = Nothing
+                Dim width As Integer
+                Dim height As Integer
+                
+                If IsNumeric(Me.ImageWidth) Then
+                    width = CInt(Me.ImageWidth)
+                Else
+                    width = 0
+                End If
+                
+                If IsNumeric(Me.imageHeight) Then
+                    height = CInt(Me.imageHeight)
+                Else
+                    height = 0
+                End If
+                
+                Try
+                    If fileType.Contains("pdf") Then
+                        ' Generate image from first page of pdf.
+                        Dim img As Drawing.Bitmap = Genesis.Common.PDFReader.GeneratePageThumb(data, 1, 85, 110)
+                        
+                        ' Resize generated image.
+                        thumbnail = Genesis.Common.GraphicTools.GraphicUtils.CreateThumbnail(img, _
+                                                                                             width, _
+                                                                                             height, _
+                                                                                             Drawing.Color.Transparent)
+                    Else
+                        ' Assume data is image.
+                        ' Check if image is bigger than requested size.
+                        Dim origImage As New System.Drawing.Bitmap(New IO.MemoryStream(data))
+                        
+                        If (height > 0 AndAlso origImage.Height <= height) OrElse (width > 0 AndAlso origImage.Width <= width) Then
+                            ' Image is smaller than requested size. Send original.
+                            Genesis.Common.BlobField.Send(_context.Response, fileType, fileName, data)
+                        Else
+                            thumbnail = Genesis.Common.GraphicTools.GraphicUtils.CreateThumbnail(data, _
+                                                                                                 width, _
+                                                                                                 height, _
+                                                                                                 Drawing.Color.Transparent)
+                        End If
+                    End If
+
+                    ' Try to resize image.
+                    memStream = New System.IO.MemoryStream()
+                    
+                    thumbnail.Save(memStream, System.Drawing.Imaging.ImageFormat.Png)
+                    
+                    Genesis.Common.BlobField.Send(_context.Response, "image/png", fileName, memStream.ToArray)
+                Catch ex As System.Threading.ThreadAbortException
+                    ' Happens when response is flushed. Do nothing.
+                Catch ex As Exception
+                    ' Error in resizing. Send original
+                    Genesis.Common.BlobField.Send(_context.Response, fileType, fileName, data)
+                Finally
+                    If thumbnail IsNot Nothing Then
+                        thumbnail.Dispose()
+                    End If
+                   
+                    If memStream IsNot Nothing Then
+                        memStream.Dispose()
+                    End If
+                End Try
+            Else
+                ' No data in blob. Send blank image
+                SendBlankImage()
+            End If
+        Else
+            If data Is Nothing OrElse data.Length = 0 Then
+                SendBlankImage()
+            Else
+                ' Send blob data to response.
+                Genesis.Common.BlobField.Send(_context.Response, fileType, fileName, data)
+            End If
+        End If
+    End Sub
+
+    Private Sub SendBlankImage()
+        _context.Response.Redirect("blank.gif")
+    End Sub
+End Class

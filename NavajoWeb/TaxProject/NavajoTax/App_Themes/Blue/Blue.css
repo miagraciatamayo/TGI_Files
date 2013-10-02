@@ -1,0 +1,42 @@
+﻿.GridView
+{
+    color: #333333;
+    margin-top: 0px;
+}
+.AlternatingRowStyle
+{
+    background-color: White;
+    text-align: center;
+}
+.EditRowStyle
+{
+    background-color: #2461BF;
+}
+.FooterStyle, .HeaderStyle 
+{
+    background-color: #507CD1;
+    font-weight: bold;
+    color: White;
+}
+.PagerStyle
+{
+    background-color: #2461BF;
+    color: White;
+    text-align: center;
+}
+.RowStyle
+{
+/*  background-color: #EFF3FB;*/
+  background-color: #A9D0F5;
+    text-align: center;
+}
+.SelectedRowStyle
+{
+    background-color: #D1DDF1;
+    font-weight: bold;
+    color: #333333;
+}
+.DetailsView
+{
+    color: #333333;    
+}

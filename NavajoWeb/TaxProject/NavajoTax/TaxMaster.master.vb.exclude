@@ -1,0 +1,13 @@
+﻿Imports System.Web.UI
+
+Partial Class TaxMaster
+    Inherits System.Web.UI.MasterPage
+
+
+
+    Protected Sub Page_Load(sender As Object, e As System.EventArgs) Handles Me.Load
+
+        Me.Page.ClientScript.RegisterStartupScript(Me.GetType, "Login", "$(document).ready(function() { showLoginDialog(); });", True)
+    End Sub
+End Class
+

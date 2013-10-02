@@ -1,0 +1,5 @@
+﻿<%@ Page Title="" Language="VB" MasterPageFile="~/TaxMaster.master" AutoEventWireup="false"
+    CodeFile="MasterTest2.aspx.vb" Inherits="MasterTest2" %>
+
+<asp:Content ID="Content2" ContentPlaceHolderID="ContentPlaceHolder1" runat="Server">
+</asp:Content>
